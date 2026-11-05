@@ -27,12 +27,13 @@ def main():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    cur.execute("SELECT id FROM accounts WHERE slug = ?", (account_slug,))
+    cur.execute("SELECT a.id, a.chrome_profile_path,g.folder_path FROM accounts a LEFT JOIN content_groups g ON g.id=a.content_group_id WHERE a.slug = ?", (account_slug,))
     row = cur.fetchone()
     if not row:
         print(f"GAK KETEMU akun dengan slug '{account_slug}' di tabel accounts. Insert dulu.")
         sys.exit(1)
     account_id = row[0]
+    content_base = Path(row[2]) if row[2] else Path.home() / "tiktok-bot" / "content" / Path(row[1]).name
 
     inserted, updated = 0, 0
     with open(csv_path, newline="", encoding="utf-8") as f:

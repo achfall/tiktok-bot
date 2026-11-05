@@ -7,6 +7,7 @@ nyelesain proses attach link (BUKAN klik Post -- belum publish).
 """
 
 import json
+import sys
 import time
 import requests
 import websocket
@@ -68,7 +69,7 @@ def click(ws, x, y, mid):
 
 
 def key_combo(ws, key, code, vkey, ctrl, mid):
-    modifiers = 2 if ctrl else 0
+    modifiers = (4 if sys.platform == "darwin" else 2) if ctrl else 0
     send_cdp(ws, "Input.dispatchKeyEvent",
               {"type": "keyDown", "modifiers": modifiers, "key": key, "code": code,
                "windowsVirtualKeyCode": vkey}, msg_id=mid)

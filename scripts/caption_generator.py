@@ -23,13 +23,16 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-BASE_DIR = Path.home() / "tiktok-bot"
+from project_paths import PROJECT_ROOT
+
+BASE_DIR = PROJECT_ROOT
 DB_PATH = BASE_DIR / "db" / "tiktok_bot.db"
 ENV_PATH = BASE_DIR / ".env"
 
 load_dotenv(ENV_PATH)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
 
 GENERIC_PROMPT_TEMPLATE = """Buatkan 1 caption promosi TikTok berbahasa Indonesia yang singkat
 (maksimal 2 kalimat pendek), gaya santai dan persuasif, untuk mendorong orang
@@ -75,10 +78,15 @@ def get_recent_captions(cur, account_id, limit=10):
 
 
 def call_gemini(prompt):
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY belum diisi")
     from google import genai
     client = genai.Client(api_key=GEMINI_API_KEY)
+    from bot_settings import load_document, effective_settings
+    config = load_document(BASE_DIR)
+    model = effective_settings(BASE_DIR)['gemini_model'] if 'gemini_model' in config.get('values', {}) else GEMINI_MODEL
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=model,
         contents=prompt,
     )
     text = (response.text or "").strip()
@@ -88,6 +96,8 @@ def call_gemini(prompt):
 
 
 def call_deepseek(prompt):
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY belum diisi; fallback tidak tersedia")
     resp = requests.post(
         "https://api.deepseek.com/chat/completions",
         headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},

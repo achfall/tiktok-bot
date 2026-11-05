@@ -9,12 +9,13 @@ Usage: python3 step2_upload_file.py
 """
 
 import json
+from pathlib import Path
 import time
 import requests
 import websocket
 
 CDP_PORT = 9221
-VIDEO_PATH = "/home/sintia/tiktok-bot/test-assets/1.mp4"
+VIDEO_PATH = str(Path.home() / "tiktok-bot/test-assets/1.mp4")
 
 
 def find_upload_tab(port):

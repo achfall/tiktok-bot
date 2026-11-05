@@ -14,6 +14,7 @@ Usage:
 """
 
 import json
+from pathlib import Path
 import sqlite3
 import sys
 import time
@@ -21,7 +22,7 @@ import requests
 import websocket
 
 CDP_PORT = 9221
-DB_PATH = "/home/sintia/tiktok-bot/db/tiktok_bot.db"
+DB_PATH = str(Path.home() / "tiktok-bot/db/tiktok_bot.db")
 OVERRIDE_TEXT = "Promo Tiktok Disini"
 TEST_CAPTION = "Jangan sampai ketinggalan promonya, cek sekarang sebelum kehabisan!"
 UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
@@ -54,7 +55,7 @@ def click(ws, x, y, mid):
 
 
 def key_combo(ws, key, code, vkey, ctrl, mid):
-    modifiers = 2 if ctrl else 0
+    modifiers = (4 if sys.platform == "darwin" else 2) if ctrl else 0
     send_cdp(ws, "Input.dispatchKeyEvent",
               {"type": "keyDown", "modifiers": modifiers, "key": key, "code": code,
                "windowsVirtualKeyCode": vkey}, msg_id=mid)
@@ -263,4 +264,8 @@ def main():
 
 
 if __name__ == "__main__":
+    with sqlite3.connect(Path(DB_PATH).as_uri() + "?mode=ro", uri=True) as check:
+        columns = {row[1] for row in check.execute("PRAGMA table_info(accounts)")}
+        if "content_group_id" in columns and check.execute("SELECT 1 FROM accounts WHERE content_group_id IS NOT NULL").fetchone():
+            raise SystemExit("Script lama tidak mendukung antrean konsep; gunakan daily_orchestrator.py.")
     main()

@@ -34,22 +34,32 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 import requests
 import websocket
 
-BASE_DIR = Path.home() / "tiktok-bot"
+from project_paths import PROJECT_ROOT
+from bot_settings import defaults, validate_values
+
+BASE_DIR = PROJECT_ROOT
 DB_PATH = BASE_DIR / "db" / "tiktok_bot.db"
-SCRIPTS_DIR = BASE_DIR / "scripts"
+SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 from caption_generator import generate_unique_caption  # noqa: E402
+from browser_lifecycle import browser_slot, prepare_browser, browser_ready
+from music_favorites import apply_favorite_music
+from archive_used import archive_after_success  # noqa: E402
+from content_queue import (scan_account, claim_video, begin_submission, finish_success,
+                           finish_failure, release_preview, prepare_retest)  # noqa: E402
 
-OVERRIDE_TEXT = "Promo Tiktok Disini"
+OVERRIDE_TEXT = defaults()['product_link_name']
 UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload"
 STEP_DELAY = 1.0
 MIN_INTERVAL_MINUTES = 35  # jeda dinamis, biar polanya gak keliatan robotik
 MAX_INTERVAL_MINUTES = 50
 WINDOW_START_HOUR = 10  # jendela posting: 10.00 - tengah malam (24.00/00.00)
+WINDOW_START_MINUTE = 0
 DEFAULT_MAX_PER_DAY = 15  # sesuai kesepakatan turun ke 10-15/hari buat versi automasi
 
 SCROLL_SNIPPET = "el.scrollIntoView({block:'center',inline:'center'});"
@@ -79,7 +89,7 @@ def click(ws, x, y, mid):
 
 
 def key_combo(ws, key, code, vkey, ctrl, mid):
-    modifiers = 2 if ctrl else 0
+    modifiers = (4 if sys.platform == "darwin" else 2) if ctrl else 0
     send_cdp(ws, "Input.dispatchKeyEvent",
               {"type": "keyDown", "modifiers": modifiers, "key": key, "code": code,
                "windowsVirtualKeyCode": vkey}, msg_id=mid)
@@ -105,12 +115,12 @@ def find_with_retry(ws, expr, mid, label, retry_wait=2.0):
 
 
 def wait_for_window():
-    """Kalau sekarang masih sebelum jam 10 pagi, tunggu sampai jam 10 baru lanjut."""
+    """Tunggu sampai jam dan menit jendela posting lokal."""
     now = datetime.now()
-    if now.hour < WINDOW_START_HOUR:
-        target = now.replace(hour=WINDOW_START_HOUR, minute=0, second=0, microsecond=0)
+    target = now.replace(hour=WINDOW_START_HOUR, minute=WINDOW_START_MINUTE, second=0, microsecond=0)
+    if now < target:
         wait_s = (target - now).total_seconds()
-        print(f"Di luar jendela posting (mulai jam {WINDOW_START_HOUR:02d}:00) -- "
+        print(f"Di luar jendela posting (mulai jam {WINDOW_START_HOUR:02d}:{WINDOW_START_MINUTE:02d}) -- "
               f"nunggu {wait_s/60:.0f} menit sampai jendela buka...")
         time.sleep(wait_s)
 
@@ -121,7 +131,177 @@ class StepFailed(Exception):
         super().__init__(message)
 
 
-def post_one_video(cdp_port, video_path, caption_text, tiktok_product_id, mode):
+
+# Identifikasi berdasarkan label di dialog, tanpa batas koordinat layar.
+PRODUCT_NAME_FIELD_JS = r"""(() => {
+ const visible = el => {const r=el.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(el).visibility!=='hidden';};
+ const fields=Array.from(document.querySelectorAll('[role="dialog"] input,dialog input'))
+   .filter(el => visible(el) && !el.disabled && !el.readOnly && el.type==='text'
+     && (Array.from(el.labels||[]).some(label=>(label.innerText||'').trim()==='Product name')
+       || el.getAttribute('aria-label')==='Product name'));
+ if(fields.length!==1)return null;
+ const el=fields[0];
+ el.scrollIntoView({block:'center',inline:'center'});
+ const r=el.getBoundingClientRect();
+ return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),value:el.value};
+})()"""
+
+PRODUCT_NAME_VALUE_JS = r"""(() => {
+ const fields=Array.from(document.querySelectorAll('[role="dialog"] input,dialog input'))
+   .filter(el=>el.getBoundingClientRect().width>0 && el.type==='text'
+     && (Array.from(el.labels||[]).some(label=>(label.innerText||'').trim()==='Product name')
+       || el.getAttribute('aria-label')==='Product name'));
+ return fields.length===1 ? fields[0].value : null;
+})()"""
+
+PRODUCT_NAME_SELECT_JS = PRODUCT_NAME_VALUE_JS.replace(
+    "return fields.length===1 ? fields[0].value : null;",
+    """if(fields.length!==1)return false;
+ const el=fields[0];el.focus();el.select();
+ return document.activeElement===el && el.selectionStart===0 && el.selectionEnd===el.value.length;""",
+)
+
+PRODUCT_ADD_BUTTON_JS = r"""(() => {
+ const fields=Array.from(document.querySelectorAll('[role="dialog"] input,dialog input'))
+   .filter(el=>el.getBoundingClientRect().width>0 && el.type==='text'
+     && (Array.from(el.labels||[]).some(label=>(label.innerText||'').trim()==='Product name')
+       || el.getAttribute('aria-label')==='Product name'));
+ if(fields.length!==1)return null;
+ const dialog=fields[0].closest('[role="dialog"],dialog');
+ const buttons=Array.from(dialog.querySelectorAll('button'))
+   .filter(el=>(el.innerText||'').trim()==='Add' && el.getBoundingClientRect().width>0);
+ if(buttons.length!==1)return null;
+ const el=buttons[0];el.scrollIntoView({block:'center',inline:'center'});
+ const r=el.getBoundingClientRect();
+ return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),disabled:el.disabled||el.getAttribute('aria-disabled')==='true'};
+})()"""
+
+
+def attach_product_link(ws, mid, product_link_name=None):
+    """Ganti nama dan klik Add di dialog produk saja; tidak Post/Save draft."""
+    link_name = validate_values({'product_link_name': product_link_name if product_link_name is not None else OVERRIDE_TEXT}, partial=True)['product_link_name']
+    step(f'  [9] Ganti nama produk jadi: "{link_name}"...')
+    field, mid = find_with_retry(ws, PRODUCT_NAME_FIELD_JS, mid, "product name field")
+    if not field:
+        raise StepFailed("Product name field not found or ambiguous")
+    mid = click(ws, field["x"], field["y"], mid)
+    time.sleep(0.5)
+    # Pilih teks lewat DOM agar tidak tergantung shortcut native macOS/Linux.
+    selected = eval_js(ws, PRODUCT_NAME_SELECT_JS, mid)
+    mid += 1
+    if not selected:
+        raise StepFailed("Product name selection failed; text and Add unchanged")
+    result = send_cdp(ws, "Input.insertText", {"text": link_name}, msg_id=mid)
+    mid += 1
+    if "error" in result:
+        raise StepFailed("Product name text insertion failed; Add not clicked")
+    time.sleep(0.6)
+    value = eval_js(ws, PRODUCT_NAME_VALUE_JS, mid)
+    mid += 1
+    if value != link_name:
+        raise StepFailed(f"Product name verification failed (actual={value!r}); Add not clicked")
+    step("  [10] Klik Add (finalisasi link)...")
+    button, mid = find_with_retry(ws, PRODUCT_ADD_BUTTON_JS, mid, "Add in product dialog")
+    if not button or button["disabled"]:
+        raise StepFailed("Product dialog Add button missing or disabled")
+    mid = click(ws, button["x"], button["y"], mid)
+    time.sleep(1.5)
+    # Dialog harus tertutup setelah Add; jangan laporkan siap bila masih terbuka.
+    remaining = eval_js(ws, PRODUCT_NAME_VALUE_JS, mid)
+    mid += 1
+    if remaining is not None:
+        raise StepFailed("Product dialog still open after Add; inspect browser")
+    return mid
+
+
+
+CAPTION_SELECT_JS = r"""(() => {
+ const fields=Array.from(document.querySelectorAll('.public-DraftEditor-content'))
+   .filter(el=>el.isContentEditable && el.getBoundingClientRect().width>0);
+ if(fields.length!==1)return false;
+ const el=fields[0];el.scrollIntoView({block:'center',inline:'center'});el.focus();
+ const range=document.createRange();range.selectNodeContents(el);
+ const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+ return document.activeElement===el && selection.rangeCount===1 && selection.getRangeAt(0).commonAncestorContainer===el;
+})()"""
+
+CAPTION_READ_JS = r"""(() => {
+ const fields=Array.from(document.querySelectorAll('.public-DraftEditor-content'))
+   .filter(el=>el.isContentEditable && el.getBoundingClientRect().width>0);
+ return fields.length===1 ? fields[0].innerText : null;
+})()"""
+
+
+def fill_caption(ws, caption_text, mid):
+    """Ganti isi DraftEditor lewat input CDP, lalu baca balik sebelum lanjut."""
+    if not caption_text or not caption_text.strip():
+        raise StepFailed("Caption kosong; editor tidak diubah")
+    selected = eval_js(ws, CAPTION_SELECT_JS, mid)
+    mid += 1
+    if not selected:
+        raise StepFailed("Caption editor selection failed; no text inserted")
+    response = send_cdp(ws, "Input.insertText", {"text": caption_text}, msg_id=mid)
+    mid += 1
+    if "error" in response:
+        raise StepFailed("Caption insertion failed")
+    # Beri waktu editor React memproses input dan render ulang.
+    time.sleep(1)
+    actual = eval_js(ws, CAPTION_READ_JS, mid)
+    mid += 1
+    normalize = lambda text: text.replace('\u00a0', ' ').replace('\r\n', '\n').strip()
+    if not isinstance(actual, str) or normalize(actual) != normalize(caption_text):
+        raise StepFailed(f"Caption verification failed (actual={actual!r}); pipeline stopped")
+    print("  Caption pada editor sudah diverifikasi.")
+    return mid
+
+
+
+POST_NOW_BUTTON_JS = r"""(() => {
+ const visible=el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0&&getComputedStyle(el).visibility!=='hidden';};
+ const buttons=Array.from(document.querySelectorAll('button')).filter(el=>visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true'&&(el.innerText||'').trim().toLowerCase()==='post now');
+ const matches=buttons.filter(button=>{
+   for(let el=button.parentElement;el&&el!==document.body;el=el.parentElement){
+     const text=(el.innerText||'').replace(/\s+/g,' ').toLowerCase();
+     if(text.length>2000)break;
+     if(text.includes('continue to post?')&&text.includes('still checking your video'))return true;
+   }
+   return false;
+ });
+ if(matches.length!==1)return null;
+ const el=matches[0];el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();
+ return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)};
+})()"""
+
+
+def confirm_pending_post(ws, mid):
+    """Klik sekali hanya konfirmasi pemeriksaan video yang telah dikenali."""
+    button = eval_js(ws, POST_NOW_BUTTON_JS, mid)
+    mid += 1
+    if not button:
+        return False, mid
+    print('  Konfirmasi "Continue to post?" terdeteksi; klik Post now.')
+    mid = click(ws, button["x"], button["y"], mid)
+    return True, mid
+
+
+def wait_for_submission(ws, mode, mid, attempts=45):
+    confirmed = False
+    url = None
+    for _ in range(attempts):
+        time.sleep(1)
+        url = eval_js(ws, "location.href", mid)
+        mid += 1
+        parsed = urlparse(url or "")
+        content = parsed.hostname in ("www.tiktok.com", "tiktok.com") and parsed.path.rstrip("/") == "/tiktokstudio/content"
+        draft = parse_qs(parsed.query).get("tab") == ["draft"]
+        if content and (not draft if mode == "auto" else draft):
+            return True, url, mid
+        if mode == "auto" and not confirmed:
+            confirmed, mid = confirm_pending_post(ws, mid)
+    return False, url, mid
+
+
+def post_one_video(cdp_port, video_path, caption_text, tiktok_product_id, mode, before_submit=None, product_link_name=None, music_context=None):
     """Jalanin 1 video full pipeline. mode: 'none' | 'auto' | 'manual'.
     Return (success: bool, error_message: str|None)."""
     resp = requests.put(f"http://127.0.0.1:{cdp_port}/json/new?{UPLOAD_URL}")
@@ -160,19 +340,7 @@ def post_one_video(cdp_port, video_path, caption_text, tiktok_product_id, mode):
         time.sleep(6)
 
         step("  [3] Isi caption...")
-        caption_pos = eval_js(ws, f"(()=>{{const el=document.querySelector('.public-DraftEditor-content');if(!el)return null;{SCROLL_SNIPPET}const r=el.getBoundingClientRect();return{{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)}};}})()", mid); mid += 1
-        if not caption_pos:
-            raise StepFailed("Caption box not found")
-        mid = click(ws, caption_pos["x"], caption_pos["y"], mid)
-        time.sleep(0.5)
-        mid = key_combo(ws, "a", "KeyA", 65, True, mid); time.sleep(0.3)
-        mid = key_combo(ws, "Delete", "Delete", 46, False, mid); time.sleep(0.3)
-        send_cdp(ws, "Runtime.evaluate",
-                 {"expression": f"navigator.clipboard.writeText({json.dumps(caption_text)})", "awaitPromise": True},
-                 msg_id=mid); mid += 1
-        time.sleep(0.4)
-        mid = key_combo(ws, "v", "KeyV", 86, True, mid)
-        time.sleep(2.5)
+        mid = fill_caption(ws, caption_text, mid)
 
         step("  [4] Klik Add link...")
         pos, mid = find_with_retry(ws, f"(()=>{{const b=Array.from(document.querySelectorAll('button')).filter(b=>(b.innerText||'').trim()==='Add');if(!b.length)return null;const el=b[b.length-1];{SCROLL_SNIPPET}const r=el.getBoundingClientRect();return{{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)}};}})()", mid, "Add link btn")
@@ -246,23 +414,19 @@ def post_one_video(cdp_port, video_path, caption_text, tiktok_product_id, mode):
         mid = click(ws, next_info["x"], next_info["y"], mid)
         time.sleep(2)
 
-        step(f"  [9] Ganti nama produk jadi: \"{OVERRIDE_TEXT}\"...")
-        field, mid = find_with_retry(ws, f"(()=>{{const i=Array.from(document.querySelectorAll('input[type=\"text\"]')).filter(e=>{{const r=e.getBoundingClientRect();return r.width>0&&r.y>300&&r.y<600;}});if(!i.length)return null;const el=i[0];{SCROLL_SNIPPET}const r=el.getBoundingClientRect();return{{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)}};}})()", mid, "product name field")
-        if not field:
-            raise StepFailed("Product name field not found")
-        mid = click(ws, field["x"], field["y"], mid)
-        time.sleep(0.5)
-        mid = key_combo(ws, "a", "KeyA", 65, True, mid); time.sleep(0.3)
-        mid = key_combo(ws, "Delete", "Delete", 46, False, mid); time.sleep(0.3)
-        send_cdp(ws, "Input.insertText", {"text": OVERRIDE_TEXT}, msg_id=mid); mid += 1
-        time.sleep(0.6)
+        mid = attach_product_link(ws, mid, product_link_name)
 
-        step("  [10] Klik Add (finalisasi link)...")
-        add_btn, mid = find_with_retry(ws, f"(()=>{{const b=Array.from(document.querySelectorAll('button')).filter(b=>(b.innerText||'').trim()==='Add');if(!b.length)return null;const el=b[b.length-1];{SCROLL_SNIPPET}const r=el.getBoundingClientRect();return{{x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2),disabled:el.disabled}};}})()", mid, "Add (finalize) btn")
-        if not add_btn or add_btn["disabled"]:
-            raise StepFailed("Add button disabled")
-        mid = click(ws, add_btn["x"], add_btn["y"], mid)
-        time.sleep(1.5)
+        if music_context is not None:
+            mid = apply_favorite_music(ws, mid, music_context['base'], music_context['account'],
+                                       music_context['content_id'], eval_js, click)
+            if eval_js(ws, CAPTION_READ_JS, mid) != caption_text:
+                raise StepFailed('Caption berubah setelah Save editor musik; submit tidak dilakukan')
+            mid += 1
+            link_name = product_link_name if product_link_name is not None else OVERRIDE_TEXT
+            link_check = f"(()=>{{const e=document.querySelector('[data-e2e=\"anchor_container\"]');return !!e&&(e.innerText||'').includes({json.dumps(link_name)});}})()"
+            if eval_js(ws, link_check, mid) is not True:
+                raise StepFailed('Link produk tidak terverifikasi setelah Save editor musik; submit tidak dilakukan')
+            mid += 1
 
         print("  >>> READY_TO_POST -- link produk udah ke-attach.")
 
@@ -290,17 +454,13 @@ def post_one_video(cdp_port, video_path, caption_text, tiktok_product_id, mode):
             success_marker = "tab=draft"
             action_label = "SIMPAN KE DRAFT"
 
+        # Simpan state persisten SEBELUM klik; hasil ambigu tidak boleh dipakai akun lain.
+        if before_submit is not None:
+            before_submit()
         mid = click(ws, action_btn["x"], action_btn["y"], mid)
 
         step("  [12] Verifikasi redirect...")
-        success = False
-        url = None
-        for _ in range(20):
-            time.sleep(1)
-            url = eval_js(ws, "location.href", mid); mid += 1
-            if url and success_marker in url:
-                success = True
-                break
+        success, url, mid = wait_for_submission(ws, mode, mid)
 
         ws.close()
         if success:
@@ -311,7 +471,7 @@ def post_one_video(cdp_port, video_path, caption_text, tiktok_product_id, mode):
                 pass
             return True, None
         else:
-            return False, f"No redirect containing '{success_marker}' within timeout (last url: {url})"
+            return False, f"Submission not verified after timeout (last url: {url}); check TikTok before retrying"
 
     except StepFailed as e:
         ws.close()
@@ -336,7 +496,7 @@ def get_active_products(cur, account_id):
            WHERE account_id=? AND active=1
            AND id NOT IN (
                SELECT product_id FROM posts_log
-               WHERE account_id=? AND status IN ('success','draft') AND DATE(published_at)=DATE('now')
+               WHERE account_id=? AND (status IN ('submitting','uncertain') OR (status IN ('success','draft') AND DATE(published_at)=DATE('now')))
            )
            ORDER BY sort_order ASC""",
         (account_id, account_id),
@@ -344,26 +504,34 @@ def get_active_products(cur, account_id):
     return cur.fetchall()
 
 
-def get_next_unused_content(cur, product_id):
-    cur.execute(
-        "SELECT id, file_path FROM contents WHERE product_id=? AND status='unused' ORDER BY id ASC LIMIT 1",
-        (product_id,),
-    )
-    return cur.fetchone()
-
-
-def mark_used(conn, content_id):
-    conn.execute("UPDATE contents SET status='used', used_at=datetime('now') WHERE id=?", (content_id,))
-    conn.commit()
-
-
-def log_post(conn, account_id, product_id, content_id, caption_text, status, error_message=None):
-    conn.execute(
-        """INSERT INTO posts_log (account_id, product_id, content_id, caption_text, status, error_message, published_at)
-           VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
-        (account_id, product_id, content_id, caption_text, status, error_message),
-    )
-    conn.commit()
+def close_account_browser(cdp_port):
+    """Tutup seluruh Chrome khusus akun secara normal, tanpa kill proses."""
+    ws = None
+    try:
+        response = requests.get(f'http://127.0.0.1:{cdp_port}/json/version', timeout=5)
+        response.raise_for_status()
+        endpoint = response.json()['webSocketDebuggerUrl']
+        parsed = urlparse(endpoint)
+        if parsed.scheme != 'ws' or parsed.hostname not in ('127.0.0.1', 'localhost') or parsed.port != cdp_port:
+            raise ValueError('Endpoint browser tidak sesuai port akun')
+        ws = websocket.create_connection(endpoint, timeout=5)
+        ws.send(json.dumps({'id': 1, 'method': 'Browser.close'}))
+        for _ in range(40):
+            if not browser_ready(cdp_port):
+                print('Chrome khusus akun ditutup; video telah terverifikasi.')
+                return True
+            time.sleep(.25)
+        print('Peringatan: Chrome masih menutup; slot belum tersedia untuk akun lain.')
+        return False
+    except Exception as error:
+        print(f'Peringatan: Chrome belum bisa ditutup otomatis ({type(error).__name__}). Hasil posting tetap tersimpan.')
+        return False
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass  # Chrome bisa memutus socket sesudah Browser.close.
 
 
 def main():
@@ -372,17 +540,35 @@ def main():
         sys.exit(1)
 
     account_slug = sys.argv[1]
+    from bot_settings import effective_settings
+    runtime = effective_settings(DB_PATH.parent.parent, account_slug)
+    global STEP_DELAY, MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES, WINDOW_START_HOUR, WINDOW_START_MINUTE, DEFAULT_MAX_PER_DAY
+    STEP_DELAY = runtime['step_delay']
+    MIN_INTERVAL_MINUTES = runtime['min_interval_minutes']
+    MAX_INTERVAL_MINUTES = runtime['max_interval_minutes']
+    WINDOW_START_HOUR = runtime['window_start_hour']
+    WINDOW_START_MINUTE = runtime['window_start_minute']
+    DEFAULT_MAX_PER_DAY = runtime['max_per_day']
     cli_publish = "--publish" in sys.argv
     max_per_day = DEFAULT_MAX_PER_DAY
     if "--limit" in sys.argv:
         max_per_day = int(sys.argv[sys.argv.index("--limit") + 1])
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     cur = conn.cursor()
 
     account = get_account(cur, account_slug)
+    from account_sources import source as account_source
+    flat = account_source(conn, account["id"])
 
-    if not cli_publish:
+    force_test_draft = "--test-draft" in sys.argv
+    if force_test_draft and (not cli_publish or "--retest-content" not in sys.argv):
+        conn.close()
+        raise SystemExit("--test-draft hanya untuk --publish --retest-content <id>.")
+    if force_test_draft:
+        mode = "manual"
+        print("TES DRAFT: aksi akhir Save draft; konfigurasi publish akun tidak diubah.")
+    elif not cli_publish:
         mode = "none"
     elif account["publish_mode"] == "auto":
         mode = "auto"
@@ -394,7 +580,45 @@ def main():
         print(f"(Kalau mau full-auto publish langsung, ubah dulu: sqlite3 db/tiktok_bot.db "
               f"\"UPDATE accounts SET publish_mode='auto' WHERE slug='{account_slug}';\")\n")
 
-    products = get_active_products(cur, account["id"])
+    retest_content = None
+    retest_id_to_claim = None
+    new_count = scan_account(conn, account["id"])
+    print(f"Scan awal: {new_count} video baru; arsip tidak dipindai.")
+    if "--retest-content" in sys.argv:
+        # Publish ulang video bekas memerlukan flag khusus di samping mode auto.
+        permitted = account["publish_mode"] in ("auto", "manual_review") and (
+            mode == "manual" or (mode == "auto" and "--allow-retest-publish" in sys.argv)
+        )
+        if not cli_publish or not permitted:
+            conn.close()
+            raise SystemExit("Tes ulang memerlukan --publish. Mode auto juga memerlukan --allow-retest-publish.")
+        try:
+            retest_id = int(sys.argv[sys.argv.index("--retest-content") + 1])
+        except (ValueError, IndexError):
+            conn.close()
+            raise SystemExit("--retest-content memerlukan ID konten numerik.")
+        row = cur.execute(
+            "SELECT p.id,p.folder_name,p.tiktok_product_id,c.id,c.file_path "
+            "FROM contents c JOIN products p ON "
+            "((c.source_folder IS NOT NULL AND c.source_folder=p.folder_path) OR (c.source_folder IS NULL AND c.product_id=p.id)) "
+            "WHERE c.id=? AND p.account_id=? AND p.active=1",
+            (retest_id, account["id"]),
+        ).fetchone()
+        if not row or not row[2] or not Path(row[4]).is_file():
+            conn.close()
+            raise SystemExit("Konten tes/produk/file tidak tersedia untuk akun ini.")
+        products = [row[:3]]
+        retest_id_to_claim = prepare_retest(conn, account["id"], row[0], row[3])
+        retest_content = True
+        max_per_day = 1
+        print(f"TES E2E ULANG: konten {retest_id}, satu {'POST PUBLIK' if mode == 'auto' else 'draft baru'}; riwayat lama tetap ada.")
+    else:
+        if flat:
+            done = cur.execute("SELECT COUNT(*) FROM posts_log WHERE account_id=? AND status IN ('success','draft') AND DATE(published_at,'localtime')=DATE('now','localtime')", (account["id"],)).fetchone()[0]
+            first = cur.execute('SELECT id,folder_name,tiktok_product_id FROM products WHERE account_id=? AND active=1 ORDER BY sort_order LIMIT 1',(account["id"],)).fetchone()
+            products = [first] * max(0, max_per_day - done) if first else []
+        else:
+            products = get_active_products(cur, account["id"])
 
     if mode == "none":
         products = products[:1]
@@ -404,47 +628,80 @@ def main():
         label = "FULL-AUTO (publish langsung)" if mode == "auto" else "AUTO-DRAFT (manual_review)"
         print(f"MODE: {label} -- max {max_per_day} produk hari ini, "
               f"jeda {MIN_INTERVAL_MINUTES}-{MAX_INTERVAL_MINUTES} menit antar-post (random), "
-              f"jendela mulai jam {WINDOW_START_HOUR:02d}:00\n")
+              f"jendela mulai jam {WINDOW_START_HOUR:02d}:{WINDOW_START_MINUTE:02d}\n")
 
     posted = 0
     for i, (product_id, folder_name, tiktok_product_id) in enumerate(products, start=1):
-        wait_for_window()
-        print(f"=== [{i}/{len(products)}] Produk: {folder_name} (ID: {tiktok_product_id}) ===")
+        if retest_content is None:
+            wait_for_window()
+        print(f"=== [{i}/{len(products)}] Video akun {account_slug} ===" if flat else f"=== [{i}/{len(products)}] Produk: {folder_name} (ID: {tiktok_product_id}) ===")
 
         if not tiktok_product_id:
             print("  SKIP -- produk gak punya tiktok_product_id (kemungkinan active tapi belum diisi).\n")
             continue
 
-        content = get_next_unused_content(cur, product_id)
-        if not content:
-            print("  SKIP -- gak ada video unused tersisa buat produk ini.\n")
-            continue
-        content_id, video_path = content
-
-        product_name_arg = folder_name if account["caption_style"] == "product_name" else None
-        caption = generate_unique_caption(cur, account["id"], product_name_arg)
-        if caption is None:
-            print("  STOP TOTAL -- caption generator gagal (Gemini + DeepSeek dua-duanya gagal).")
-            log_post(conn, account["id"], product_id, content_id, None, "failed", "Caption generation failed")
+        try:
+            claim = claim_video(conn, account["id"], product_id, retest_id_to_claim)
+        except ValueError as error:
+            print(f"  STOP: {error}")
             break
-        conn.execute("INSERT INTO captions_history (account_id, caption_text) VALUES (?, ?)",
-                     (account["id"], caption))
-        conn.commit()
-        print(f"  Caption: \"{caption}\"")
-
-        success, error = post_one_video(account["cdp_port"], video_path, caption, tiktok_product_id, mode)
-
-        if success:
-            if mode in ("auto", "manual"):
-                mark_used(conn, content_id)
-                log_status = "success" if mode == "auto" else "draft"
-                log_post(conn, account["id"], product_id, content_id, caption, log_status)
-                posted += 1
-            print()
-        else:
-            print(f"  GAGAL: {error}")
-            log_post(conn, account["id"], product_id, content_id, caption, "failed", error)
-            print("\n>>> STOP TOTAL -- sisa produk hari ini TIDAK diproses (sesuai retry policy).")
+        if not claim:
+            print("  SKIP -- tidak ada video unused yang tersedia (mungkin dikunci akun lain).\n")
+            continue
+        content_id, video_path = claim.content_id, claim.path
+        if flat:
+            product_id = claim.product_id
+            tiktok_product_id = cur.execute('SELECT tiktok_product_id FROM content_assignments WHERE content_id=?',(content_id,)).fetchone()[0]
+            folder_name = 'ID ' + tiktok_product_id
+            print(f'  Pasangan tersimpan: video {content_id} → produk {tiktok_product_id}')
+        print(f"  Klaim video {content_id} untuk {account_slug}: {Path(video_path).name}")
+        caption = None
+        try:
+            product_name_arg = folder_name if account["caption_style"] == "product_name" and not flat else None
+            caption = generate_unique_caption(cur, account["id"], product_name_arg)
+            if caption is None:
+                raise StepFailed("Caption generation failed")
+            conn.execute("INSERT INTO captions_history (account_id, caption_text) VALUES (?, ?)",
+                         (account["id"], caption))
+            conn.commit()
+            print(f'  Caption: "{caption}"')
+            with browser_slot(DB_PATH.parent.parent, account_slug, account['cdp_port'], runtime['max_parallel_browsers']):
+                prepare_browser(DB_PATH.parent.parent, account_slug, account['cdp_port'])
+                success, error = post_one_video(
+                    account["cdp_port"], video_path, caption, tiktok_product_id, mode,
+                    before_submit=lambda: begin_submission(conn, claim, caption),
+                    product_link_name=runtime['product_link_name'],
+                    music_context={'base': DB_PATH.parent.parent, 'account': account_slug,
+                                   'content_id': content_id} if runtime['music_enabled'] else None,
+                )
+                if success:
+                    if mode in ("auto", "manual"):
+                        finish_success(conn, claim, mode)
+                        archive_after_success(conn, content_id)
+                        posted += 1
+                        held = cur.execute("SELECT 1 FROM contents WHERE claimed_by=? AND status IN ('claimed','submitting','uncertain') LIMIT 1", (account['id'],)).fetchone()
+                        if not held:
+                            if close_account_browser(account['cdp_port']) is False:
+                                print('STOP: Chrome belum tertutup. Hasil video tersimpan; periksa browser sebelum melanjutkan.')
+                                break
+                    else:
+                        release_preview(conn, claim)
+                    print()
+                else:
+                    state = finish_failure(conn, claim, caption, error)
+                    print(f"  GAGAL: {error}")
+                    if state == "uncertain":
+                        print("  VIDEO DITAHAN: hasil submit belum pasti; periksa TikTok sebelum retry.")
+                    print("\n>>> STOP TOTAL -- sisa produk hari ini tidak diproses.")
+                    break
+        except BaseException as error:
+            conn.rollback()
+            # Hasil yang sudah selesai tidak diubah jika penutupan browser gagal.
+            if cur.execute('SELECT status FROM contents WHERE id=?', (content_id,)).fetchone()[0] != 'used':
+                finish_failure(conn, claim, caption, str(error))
+            if not isinstance(error, Exception):
+                raise
+            print(f"  STOP TOTAL: {error}")
             break
 
         if mode in ("auto", "manual") and i < len(products):
@@ -453,7 +710,7 @@ def main():
             time.sleep(wait_minutes * 60)
 
     conn.close()
-    print(f"\n=== SELESAI. Total berhasil publish: {posted} ===")
+    print(f"\n=== SELESAI. Total berhasil {'simpan draft' if mode == 'manual' else 'publish'}: {posted} ===")
 
 
 if __name__ == "__main__":

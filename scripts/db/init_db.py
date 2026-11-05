@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Bikin/update file database SQLite sesuai schema.sql -- aman dijalanin berkali-kali."""
 import sqlite3
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from content_queue import migrate
 
 DB_PATH = Path.home() / "tiktok-bot" / "db" / "tiktok_bot.db"
 SCHEMA_PATH = Path.home() / "tiktok-bot" / "scripts" / "db" / "schema.sql"
 
 def main():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounts'").fetchone():
+        migrate(conn)
     with open(SCHEMA_PATH) as f:
         conn.executescript(f.read())
     conn.commit()

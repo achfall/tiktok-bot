@@ -14,8 +14,12 @@ Usage:
 import sqlite3
 import sys
 from pathlib import Path
+from content_queue import scan_account
+from account_sources import source as account_source
 
-DB_PATH = Path.home() / "tiktok-bot" / "db" / "tiktok_bot.db"
+from project_paths import PROJECT_ROOT
+
+DB_PATH = PROJECT_ROOT / "db/tiktok_bot.db"
 VIDEO_EXTENSIONS = {".mp4", ".mov"}
 
 
@@ -29,7 +33,11 @@ def get_account_id(cur, slug):
 
 
 def get_content_base(slug):
-    return Path.home() / "tiktok-bot" / "content" / slug
+    with sqlite3.connect(DB_PATH.as_uri() + "?mode=ro", uri=True) as conn:
+        row = conn.execute("SELECT a.chrome_profile_path,g.folder_path FROM accounts a LEFT JOIN content_groups g ON g.id=a.content_group_id WHERE a.slug=?", (slug,)).fetchone()
+    if not row:
+        raise ValueError(f"Akun tidak ditemukan: {slug}")
+    return Path(row[1]) if row[1] else DB_PATH.parent.parent / "content" / Path(row[0]).name
 
 
 def cmd_list(cur, account_slug):
@@ -48,8 +56,14 @@ def cmd_list(cur, account_slug):
 
 def cmd_add(cur, conn, account_slug, folder_name, product_id, sort_order=None):
     account_id = get_account_id(cur, account_slug)
+    if not folder_name or Path(folder_name).name != folder_name or folder_name in (".", "..", "sudah-dipakai"):
+        raise ValueError("Nama folder produk tidak valid")
     content_base = get_content_base(account_slug)
     folder_path = content_base / folder_name
+    if folder_path.is_dir():
+        for existing in content_base.iterdir():
+            if existing.is_dir() and existing.samefile(folder_path) and existing.name != folder_name:
+                raise ValueError(f"Gunakan nama folder persis: {existing.name}")
 
     if not folder_path.is_dir():
         print(f"WARNING: folder '{folder_path}' belum ada -- produk tetap diinsert,"
@@ -74,13 +88,8 @@ def cmd_add(cur, conn, account_slug, folder_name, product_id, sort_order=None):
     conn.commit()
     print(f"Produk '{folder_name}' ditambahin (sort_order={sort_order}, id={product_row_id}).")
 
-    if folder_path.is_dir():
-        videos = sorted(p for p in folder_path.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS)
-        for v in videos:
-            cur.execute("INSERT INTO contents (product_id, file_path, status) VALUES (?, ?, 'unused')",
-                        (product_row_id, str(v)))
-        conn.commit()
-        print(f"Scan folder: {len(videos)} video ditemukan & masuk queue.")
+    added = scan_account(conn, account_id)
+    print(f"Scan folder: {added} video baru masuk antrean bersama/pribadi.")
 
 
 def cmd_toggle(cur, conn, account_slug, folder_name, new_active):
@@ -115,8 +124,11 @@ def main():
     action = sys.argv[1]
     account_slug = sys.argv[2]
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     cur = conn.cursor()
+    aid = get_account_id(cur, account_slug)
+    if action != "list" and account_source(conn, aid):
+        raise SystemExit("Akun memakai folder pribadi: edit ID-produk.txt lalu scan; jangan ubah produk satu per satu.")
 
     if action == "list":
         cmd_list(cur, account_slug)

@@ -6,6 +6,7 @@ from pathlib import Path
 import secrets
 import tempfile
 import threading
+import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote, parse_qs
 import sys
@@ -14,14 +15,30 @@ CODE_ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(CODE_ROOT/'scripts'))
 from project_paths import PROJECT_ROOT
 from botapp.service import ControlService
+from botapp import API_VERSION
+from media_limits import MAX_VIDEO_BYTES
 
 ASSETS=CODE_ROOT/'web'
 MAX_JSON=64*1024
-MAX_VIDEO=2*1024*1024*1024
+MAX_VIDEO=MAX_VIDEO_BYTES
+
+
+def schedule_tick_safely(service):
+    try:
+        service.schedule_tick()
+    except Exception as error:
+        # Pesan exception bisa berisi payload; log hanya nama kelasnya.
+        return type(error).__name__
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'
+
+    def setup(self):
+        super().setup()
+        if hasattr(self.connection,'settimeout'):
+            self.connection.settimeout(30)
 
     def log_message(self,format,*args):
         pass  # Payload, token, API key dan query tidak masuk log HTTP.
@@ -59,7 +76,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path=='/api/v1/logs':
                 rid=parse_qs(parsed.query).get('id',[''])[0]
                 self.send_payload(200,{'text':self.server.service.redact(self.server.service.jobs.logs(rid))})
-            elif parsed.path=='/api/v1/health':self.send_payload(200,{'status':'ok','api_version':1})
+            elif parsed.path=='/api/v1/health':self.send_payload(200,{'status':'ok','api_version':API_VERSION})
             else:
                 files={'/':('index.html','text/html; charset=utf-8'),'/app.js':('app.js','text/javascript; charset=utf-8'),'/styles.css':('styles.css','text/css; charset=utf-8'),'/favicon.svg':('favicon.svg','image/svg+xml')}
                 if parsed.path not in files:self.send_payload(404,{'error':'Halaman tidak ditemukan.'});return
@@ -74,6 +91,8 @@ class Handler(BaseHTTPRequestHandler):
         length=int(self.headers.get('Content-Length','0'))
         if not 0<length<=MAX_VIDEO:raise ValueError('Ukuran video harus 1 byte–2 GB.')
         product,target=self.server.service.upload_target(product_id,filename)
+        if shutil.disk_usage(target.parent).free < length + 256*1024*1024:
+            raise ValueError('Ruang disk tidak cukup untuk video dan cadangan penyimpanan.')
         fd,name=tempfile.mkstemp(prefix='.upload-',suffix='.part',dir=target.parent)
         try:
             remaining=length
@@ -133,9 +152,12 @@ def main():
     except OSError as error:raise SystemExit(f'Panel belum bisa membuka port lokal: {error}')
     stopped=threading.Event()
     def scheduler():
+        previous_error=None
         while not stopped.wait(5):
-            try:service.schedule_tick()
-            except (ValueError,OSError):pass
+            error=schedule_tick_safely(service)
+            if error and error!=previous_error:
+                print(f'Scheduler gagal pada satu tick ({error}); akan mencoba tick berikutnya.',flush=True)
+            previous_error=error
     thread=threading.Thread(target=scheduler,daemon=True);thread.start()
     print(f'Panel lokal: http://127.0.0.1:{args.port}',flush=True)
     print('Jadwal hanya aktif selama panel berjalan. Ctrl+C untuk menutup panel.',flush=True)

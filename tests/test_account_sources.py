@@ -114,20 +114,64 @@ class AccountSourcesTests(unittest.TestCase):
 
     def test_orchestrator_rotates_within_daily_video_limit(self):
         self.videos(4);seen=[];events=[]
-        def upload(port,path,caption,pid,mode,before_submit,product_link_name=None,music_context=None):
+        def upload(port,path,caption,pid,mode,before_submit,product_link_name=None,music_context=None,expected_profile=None):
             events.append('upload')
             seen.append((Path(path).name,pid));before_submit();return True,None
         def close(port):
             self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='used'").fetchone()[0],len(seen))
             events.append('close')
             return True
-        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',side_effect=lambda *args:events.append('open')) as prepare,patch.object(bot,'close_account_browser',side_effect=close) as close_browser,patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','3']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'post_one_video',side_effect=upload),patch.object(bot,'wait_for_window',side_effect=lambda:events.append('window')),patch.object(bot.time,'sleep',side_effect=lambda _:events.append('wait')),contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',side_effect=lambda *args:(events.append('open') or True)) as prepare,patch.object(bot,'close_account_browser',side_effect=close) as close_browser,patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','3']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'post_one_video',side_effect=upload),patch.object(bot,'wait_for_window',side_effect=lambda:events.append('window')),patch.object(bot,'wait_until',side_effect=lambda _:events.append('wait')),contextlib.redirect_stdout(io.StringIO()):
             bot.main();bot.main()
         self.assertEqual(close_browser.call_count,3)
         self.assertEqual(prepare.call_count,3)
         self.assertEqual([pid for _,pid in seen],['11111','22222','11111'])
         self.assertEqual(len({name for name,_ in seen}),3)
         self.assertEqual(events,['window','open','upload','close','wait','window','open','upload','close','wait','window','open','upload','close'])
+
+    def test_settings_daily_limit_cannot_be_raised_by_cli_or_restart(self):
+        self.videos(4)
+        self.service.save_settings({'account':'akun1','values':{'max_per_day':2}})
+        def upload(port,path,caption,pid,mode,before_submit,**kwargs):
+            before_submit();return True,None
+        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',return_value=True) as prepare,patch.object(bot,'close_account_browser',return_value=True),patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','99']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'post_one_video',side_effect=upload) as posting,patch.object(bot,'wait_for_window'),patch.object(bot,'wait_until'),contextlib.redirect_stdout(io.StringIO()):
+            bot.main();bot.main()
+        self.assertEqual(posting.call_count,2)
+        self.assertEqual(prepare.call_count,2)
+        self.assertEqual(q.daily_post_count(self.conn,1),2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='unused'").fetchone()[0],2)
+
+    def test_wake_during_preparation_keeps_claim_and_daily_target(self):
+        self.videos(2); attempts=[]
+        def upload(port,path,caption,pid,mode,before_submit,**kwargs):
+            token=self.conn.execute("SELECT claim_token FROM contents WHERE status='claimed'").fetchone()[0]
+            attempts.append((path,caption,pid,token))
+            if len(attempts)==1:
+                bot.WAKE_MONITOR.last-=3600
+                bot.WAKE_MONITOR.sample()
+                return False,'sleep interrupted preparation'
+            before_submit();return True,None
+        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',return_value=True),patch.object(bot,'close_account_browser',return_value=True),patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','1']),patch.object(bot,'generate_unique_caption',return_value='same caption') as captions,patch.object(bot,'post_one_video',side_effect=upload),patch.object(bot,'wait_for_window'),patch.object(bot,'browser_ready',return_value=True),patch('wake_recovery.WakeMonitor.wait_for_network'),contextlib.redirect_stdout(io.StringIO()):
+            bot.main()
+        self.assertEqual(len(attempts),2)
+        self.assertEqual(attempts[0],attempts[1])
+        captions.assert_called_once()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM posts_log WHERE status IN ('success','draft')").fetchone()[0],1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='unused'").fetchone()[0],1)
+
+    def test_wake_after_submission_holds_video_without_retry(self):
+        self.videos(2)
+        def upload(port,path,caption,pid,mode,before_submit,**kwargs):
+            before_submit()
+            bot.WAKE_MONITOR.last-=3600
+            bot.WAKE_MONITOR.sample()
+            return False,'sleep interrupted verification'
+        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',return_value=True),patch.object(bot,'close_account_browser') as close,patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','2']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'post_one_video',side_effect=upload) as posting,patch.object(bot,'wait_for_window'),contextlib.redirect_stdout(io.StringIO()):
+            bot.main()
+        posting.assert_called_once();close.assert_not_called()
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='uncertain'").fetchone()[0],1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM posts_log WHERE status='uncertain'").fetchone()[0],1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='unused'").fetchone()[0],1)
 
     def test_launcher_failure_releases_claim_without_upload(self):
         self.videos(1)
@@ -138,9 +182,9 @@ class AccountSourcesTests(unittest.TestCase):
 
     def test_close_failure_preserves_used_video_and_stops_next_upload(self):
         self.videos(2)
-        def upload(port,path,caption,pid,mode,before_submit,product_link_name=None,music_context=None):
+        def upload(port,path,caption,pid,mode,before_submit,product_link_name=None,music_context=None,expected_profile=None):
             before_submit();return True,None
-        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser'),patch.object(bot,'post_one_video',side_effect=upload) as posting,patch.object(bot,'close_account_browser',return_value=False),patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','2']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'wait_for_window'),patch.object(bot.time,'sleep') as sleep,contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',return_value=True),patch.object(bot,'post_one_video',side_effect=upload) as posting,patch.object(bot,'close_account_browser',return_value=False),patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','2']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'wait_for_window'),patch.object(bot.time,'sleep') as sleep,contextlib.redirect_stdout(io.StringIO()):
             bot.main()
         posting.assert_called_once();sleep.assert_not_called()
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='used'").fetchone()[0],1)

@@ -18,9 +18,30 @@ import daily_orchestrator as bot
 from archive_used import archive_content
 from manage_concepts import assign, rename_concept
 from bot_settings import defaults
+from upload_overlays import TOUR_CLOSE_JS
 
 
 class SharedQueueTests(unittest.TestCase):
+    def test_upload_waits_for_delayed_file_input_without_upload_or_reload(self):
+        calls=[]
+        def cdp(ws, method, params=None, msg_id=None):
+            calls.append(method)
+            if method=='DOM.getDocument':return {'result':{'root':{'nodeId':len(calls)}}}
+            return {'result':{'nodeId':42 if calls.count('DOM.querySelector')==8 else 0}}
+        with patch.object(bot,'send_cdp',side_effect=cdp),patch.object(bot.time,'sleep') as sleep,contextlib.redirect_stdout(io.StringIO()):
+            node,mid=bot.wait_for_upload_input(None,1)
+        self.assertEqual(node,42)
+        self.assertEqual(mid,17)
+        self.assertEqual(sleep.call_count,7)
+        self.assertEqual(set(calls),{'DOM.getDocument','DOM.querySelector'})
+
+    def test_missing_upload_input_stops_after_bounded_wait(self):
+        def cdp(ws,method,params=None,msg_id=None):
+            return {'result':{'root':{'nodeId':1}}} if method=='DOM.getDocument' else {'result':{'nodeId':0}}
+        with patch.object(bot,'send_cdp',side_effect=cdp),patch.object(bot.time,'sleep') as sleep,contextlib.redirect_stdout(io.StringIO()),self.assertRaises(bot.StepFailed):
+            bot.wait_for_upload_input(None,1)
+        self.assertEqual(sleep.call_count,10)
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.base=Path(self.temp.name);self.db=self.base/'test.db'
@@ -77,6 +98,39 @@ class SharedQueueTests(unittest.TestCase):
         self.assertEqual(archived.parent,folder/'sudah-dipakai/tiktok2.id')
         self.assertFalse(path.exists())
         q.scan_account(self.conn,1);self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM contents').fetchone()[0],1)
+
+    def test_daily_count_uses_local_day_and_includes_uncertain_but_not_failures(self):
+        folder=self.add_account(1);self.add_account(2)
+        self.video(folder);q.scan_account(self.conn,1)
+        cid=self.conn.execute('SELECT id FROM contents').fetchone()[0]
+        for status in ('success','draft','submitting','uncertain','failed'):
+            self.conn.execute("INSERT INTO posts_log(account_id,product_id,content_id,status,published_at) VALUES(1,1,?,?,datetime('now'))",(cid,status))
+        self.conn.execute("INSERT INTO posts_log(account_id,product_id,content_id,status,published_at) VALUES(1,1,?,'success',datetime('now','-2 days'))",(cid,))
+        self.conn.commit()
+        self.assertEqual(q.daily_post_count(self.conn,1),4)
+        self.assertEqual(q.daily_post_count(self.conn,2),0)
+        claim=q.claim_video(self.conn,1,1)
+        with self.assertRaisesRegex(ValueError,'Batas video'):
+            q.begin_submission(self.conn,claim,'caption',daily_limit=4)
+        self.assertEqual(self.conn.execute('SELECT status FROM contents WHERE id=?',(cid,)).fetchone()[0],'claimed')
+        self.assertEqual(q.daily_post_count(self.conn,1),4)
+
+    def test_legacy_restart_uses_remaining_daily_quota(self):
+        folder=self.add_account(1);self.video(folder)
+        for pid in (2,3):
+            extra=folder.parent/f'produk{pid}';extra.mkdir();self.video(extra)
+            self.conn.execute("INSERT INTO products(id,account_id,folder_path,folder_name,sort_order,tiktok_product_id) VALUES(?,1,?,?,?,'12345')",(pid,str(extra),extra.name,pid))
+        self.conn.commit();q.scan_account(self.conn,1)
+        claim=q.claim_video(self.conn,1,1)
+        q.begin_submission(self.conn,claim,'earlier');q.finish_success(self.conn,claim,'auto')
+        runtime={**defaults(),'max_per_day':2}
+        def upload(port,path,caption,pid,mode,before_submit,**kwargs):
+            before_submit();return True,None
+        with patch('bot_settings.effective_settings',return_value=runtime),patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',return_value=True),patch.object(bot,'close_account_browser',return_value=True),patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',['bot','akun1','--publish','--limit','99']),patch.object(bot,'generate_unique_caption',return_value='caption'),patch.object(bot,'post_one_video',side_effect=upload) as posting,patch.object(bot,'wait_for_window'),patch.object(bot,'wait_until'),contextlib.redirect_stdout(io.StringIO()):
+            bot.main();bot.main()
+        posting.assert_called_once()
+        self.assertEqual(q.daily_post_count(self.conn,1),2)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM contents WHERE status='unused'").fetchone()[0],1)
 
     def test_retest_copy_keeps_original_history(self):
         folder=self.add_account(1);source=self.video(folder);q.scan_account(self.conn,1)
@@ -169,7 +223,7 @@ class SharedQueueTests(unittest.TestCase):
         self.assertEqual(old_log,self.conn.execute('SELECT * FROM posts_log').fetchall())
         self.assertFalse((self.base/'content/video-jahit').exists())
 
-    def run_e2e(self,mode,timeout=False,force_draft=False,link_name=None,music_enabled=False,music_failure=False):
+    def run_e2e(self,mode,timeout=False,force_draft=False,link_name=None,music_enabled=False,music_failure=False,copyright_prompt=False):
         runtime=defaults()
         runtime['music_enabled']=music_enabled
         if link_name is not None:runtime['product_link_name']=link_name
@@ -178,9 +232,15 @@ class SharedQueueTests(unittest.TestCase):
             q.scan_account(self.conn,1)
             original=q.claim_video(self.conn,1,1)
             q.begin_submission(self.conn,original,'caption lama');q.finish_success(self.conn,original,'auto');archive_content(self.conn,original.content_id)
-        state={'caption':'video','product':'old','dialog':True,'target':None,'selected':None,'submitted':False,'confirmed':False,'uploads':0}
-        response=MagicMock();response.json.return_value={'id':'tab','webSocketDebuggerUrl':'ws://fake'}
+        state={'caption':'video','product':'old','dialog':True,'target':None,'selected':None,'submitted':False,'confirmed':False,'uploads':0,'picker_stage':'none'}
+        response=MagicMock();response.json.return_value={'id':'tab','webSocketDebuggerUrl':'ws://127.0.0.1:9221/devtools/page/tab'}
+        (self.base/'chrome-profiles/tiktok1.id/Default').mkdir(parents=True,exist_ok=True)
         def evaluate(ws,expr,mid):
+            if "#profile_path" in expr:
+                return str(self.base/'chrome-profiles/tiktok1.id/Default')
+            if expr==bot.PRODUCT_PICKER_STATE_JS:return {'stage':state['picker_stage']}
+            if expr==bot.ADD_LINK_BUTTON_JS:state['target']='open_link';return {'x':1,'y':2}
+            if expr==bot.ADD_LINK_NEXT_JS:state['target']='link_next';return {'x':1,'y':2}
             if expr==bot.CAPTION_SELECT_JS:state['selected']='caption';return True
             if expr==bot.CAPTION_READ_JS:return state['caption']
             if 'anchor_container' in expr:return True
@@ -189,15 +249,20 @@ class SharedQueueTests(unittest.TestCase):
             if expr==bot.PRODUCT_ADD_BUTTON_JS:state['target']='attach';return {'x':1,'y':2,'disabled':False}
             if expr==bot.PRODUCT_NAME_FIELD_JS:return {'x':1,'y':2}
             if expr==bot.POST_NOW_BUTTON_JS:
-                if state['submitted'] and not state['confirmed']:state['target']='confirm';return {'x':1,'y':2}
+                if state['submitted'] and not state['confirmed'] and (mode=='auto' or copyright_prompt):state['target']='confirm';return {'x':1,'y':2}
                 return None
             if expr=='location.href':
-                if state['submitted'] and not timeout and (mode=='manual_review' or state['confirmed']):return 'https://www.tiktok.com/tiktokstudio/content'+('?tab=draft' if mode=='manual_review' else '')
+                if state['submitted'] and not timeout and ((mode in ('manual_review','schedule') and not copyright_prompt) or state['confirmed']):return 'https://www.tiktok.com/tiktokstudio/content'+('?tab=draft' if mode=='manual_review' else '')
                 return 'https://www.tiktok.com/tiktokstudio/upload'
+            if state.get('schedule_target') and expr==bot.schedule_ui.confirmation_guard(state['schedule_target']):return True
+            if 'components_PostInfoCell_FlexColumn' in expr:
+                return bool(state['submitted'] and not timeout and state.get('schedule_verified'))
             if "toLowerCase()==='my shop'" in expr:return False
             if "trim()==='Post'" in expr or "trim()==='Save draft'" in expr:state['target']='submit'
+            if 'post_video_button' in expr and 'Schedule' in expr:state['target']='submit'
             return {'x':1,'y':2,'disabled':False}
         def send(ws,method,params=None,msg_id=1):
+            state.setdefault('methods',[]).append(method)
             if method=='Input.insertText' and state['selected']:state[state['selected']]=params['text']
             if method=='DOM.getDocument':return {'result':{'root':{'nodeId':1}}}
             if method=='DOM.querySelector':return {'result':{'nodeId':2}}
@@ -211,10 +276,13 @@ class SharedQueueTests(unittest.TestCase):
         def click(ws,x,y,mid):
             state['selected']=None
             target=state.pop('target',None)
+            if target=='open_link':state['picker_stage']='link_type'
+            if target=='link_next':state['picker_stage']='picker'
             if target=='attach':
                 self.assertEqual(state['product'],runtime['product_link_name']);state['dialog']=False
             if target=='submit':
                 if music_enabled:self.assertTrue(state.get('music_verified'))
+                if mode=='schedule':self.assertTrue(state.get('schedule_verified'))
                 with contextlib.closing(sqlite3.connect(self.db)) as check:
                     self.assertEqual(check.execute('SELECT status FROM contents').fetchone()[0],'submitting')
                 self.assertEqual(state['caption'],'Caption E2E');state['submitted']=True
@@ -229,12 +297,18 @@ class SharedQueueTests(unittest.TestCase):
             if music_failure:raise RuntimeError('Favorites kosong')
             state['music_verified']=True
             return mid+1
-        with patch.object(bot,'apply_favorite_music',side_effect=apply_music) as music_step,patch('bot_settings.effective_settings',return_value=runtime),patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser'),patch.object(bot,'close_account_browser') as close_browser,patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',args),patch.object(bot,'generate_unique_caption',return_value='Caption E2E'),patch.object(bot.requests,'put',return_value=response),patch.object(bot.requests,'get'),patch.object(bot.websocket,'create_connection',return_value=MagicMock()),patch.object(bot,'eval_js',side_effect=evaluate),patch.object(bot,'send_cdp',side_effect=send),patch.object(bot,'click',side_effect=click),patch.object(bot.time,'sleep'),contextlib.redirect_stdout(output):
+        def configure_schedule(ws,mid,target,evaluate,click):
+            self.assertFalse(state['submitted'])
+            self.assertGreater(target,datetime.now(target.tzinfo))
+            state['schedule_verified']=True
+            state['schedule_target']=target
+            return mid+1
+        with patch.object(bot.schedule_ui,'configure',side_effect=configure_schedule),patch.object(bot,'apply_favorite_music',side_effect=apply_music) as music_step,patch('bot_settings.effective_settings',return_value=runtime),patch.object(bot,'browser_slot',return_value=contextlib.nullcontext()),patch.object(bot,'prepare_browser',return_value=True),patch.object(bot,'close_account_browser') as close_browser,patch.object(bot,'DB_PATH',self.db),patch.object(sys,'argv',args),patch.object(bot,'generate_unique_caption',return_value='Caption E2E'),patch.object(bot.requests,'put',return_value=response),patch.object(bot.requests,'get'),patch.object(bot.websocket,'create_connection',return_value=MagicMock()),patch.object(bot,'eval_js',side_effect=evaluate),patch.object(bot,'send_cdp',side_effect=send),patch.object(bot,'click',side_effect=click),patch.object(bot.time,'sleep'),patch.object(bot,'wait_until'),contextlib.redirect_stdout(output):
             bot.main()
         if music_enabled:music_step.assert_called_once()
         else:music_step.assert_not_called()
         if music_failure:
-            self.assertFalse(state['submitted']);close_browser.assert_not_called()
+            self.assertFalse(state['submitted']);close_browser.assert_called_once_with(9221)
             self.assertEqual(self.conn.execute('SELECT status FROM contents').fetchone()[0],'unused')
             self.assertTrue(source.exists())
             return state
@@ -243,6 +317,8 @@ class SharedQueueTests(unittest.TestCase):
         else:
             close_browser.assert_called_once_with(9221)
         self.assertEqual(state['uploads'],1)
+        self.assertNotIn('Input.enable',state['methods'])
+        self.assertNotIn('Browser.grantPermissions',state['methods'])
         self.assertTrue(state['submitted'],output.getvalue())
         status,path=self.conn.execute('SELECT status,file_path FROM contents ORDER BY id DESC LIMIT 1').fetchone()
         if timeout:
@@ -255,6 +331,21 @@ class SharedQueueTests(unittest.TestCase):
 
     def test_e2e_draft_with_real_orchestrator_and_simulated_cdp(self):
         self.run_e2e('manual_review')
+
+    def test_e2e_schedule_with_product_and_music_using_simulated_cdp(self):
+        result=self.run_e2e('schedule',music_enabled=True)
+        self.assertFalse(result['confirmed'])
+        self.assertEqual(self.conn.execute('SELECT status FROM posts_log').fetchone()[0],'scheduled')
+
+    def test_e2e_schedule_timeout_holds_claim_without_post_now(self):
+        result=self.run_e2e('schedule',timeout=True)
+        self.assertFalse(result['confirmed'])
+        self.assertEqual(self.conn.execute('SELECT status FROM posts_log').fetchone()[0],'uncertain')
+
+    def test_e2e_schedule_resolves_copyright_prompt_then_verifies_scheduled_row(self):
+        result=self.run_e2e('schedule',copyright_prompt=True)
+        self.assertTrue(result['confirmed'])
+        self.assertEqual(self.conn.execute('SELECT status FROM posts_log').fetchone()[0],'scheduled')
 
     def test_e2e_custom_product_link_name_draft(self):
         self.run_e2e('manual_review',link_name='Cek Produk Pilihan')
@@ -276,11 +367,48 @@ class SharedQueueTests(unittest.TestCase):
             with self.assertRaises(bot.StepFailed):bot.attach_product_link(MagicMock(),1,'Cek Produk Pilihan')
         find.assert_called_once()
 
+    def test_product_picker_retries_lost_add_click_and_waits_for_dialog(self):
+        state={'stage':'none','target':None,'add':0,'next':0}
+        def evaluate(ws,expr,mid):
+            if expr==TOUR_CLOSE_JS:return None
+            if expr==bot.PRODUCT_PICKER_STATE_JS:return {'stage':state['stage']}
+            if expr==bot.ADD_LINK_BUTTON_JS:state['target']='add';return {'x':1,'y':2}
+            if expr==bot.ADD_LINK_NEXT_JS:state['target']='next';return {'x':1,'y':2}
+            self.fail('Unexpected picker expression')
+        def click(ws,x,y,mid):
+            state[state['target']]+=1
+            if state['target']=='add' and state['add']==2:state['stage']='link_type'
+            if state['target']=='next':state['stage']='picker'
+            return mid+2
+        with patch.object(bot,'eval_js',side_effect=evaluate),patch.object(bot,'click',side_effect=click),patch.object(bot.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            bot.open_product_picker(None,1)
+        self.assertEqual((state['add'],state['next']),(2,1))
+
+    def test_product_picker_does_not_click_add_again_when_dialog_loading(self):
+        stages=iter([{'stage':'none'},{'stage':'link_type'},{'stage':'unknown'},{'stage':'unknown'},{'stage':'picker'}])
+        def evaluate(ws,expr,mid):
+            return next(stages) if expr==bot.PRODUCT_PICKER_STATE_JS else {'x':1,'y':2}
+        with patch.object(bot,'eval_js',side_effect=evaluate),patch.object(bot,'click',side_effect=lambda ws,x,y,mid:mid+2) as click,patch.object(bot.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+            bot.open_product_picker(None,1)
+        self.assertEqual(click.call_count,2)
+
+    def test_product_picker_already_open_does_not_click(self):
+        with patch.object(bot,'eval_js',return_value={'stage':'picker'}),patch.object(bot,'click') as click:
+            bot.open_product_picker(None,1)
+        click.assert_not_called()
+
+    def test_product_picker_timeout_does_not_click_obstructed_button(self):
+        def evaluate(ws,expr,mid):
+            return {'stage':'none'} if expr==bot.PRODUCT_PICKER_STATE_JS else None
+        with patch.object(bot,'eval_js',side_effect=evaluate),patch.object(bot,'click') as click,patch.object(bot.time,'sleep'):
+            with self.assertRaises(bot.StepFailed):bot.open_product_picker(None,1)
+        click.assert_not_called()
+
     def test_window_waits_until_configured_minute(self):
-        with patch.object(bot,'WINDOW_START_HOUR',21),patch.object(bot,'WINDOW_START_MINUTE',30),patch.object(bot,'datetime') as clock,patch.object(bot.time,'sleep') as sleep,contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(bot,'WINDOW_START_HOUR',21),patch.object(bot,'WINDOW_START_MINUTE',30),patch.object(bot,'datetime') as clock,patch.object(bot,'wait_until') as sleep,contextlib.redirect_stdout(io.StringIO()):
             clock.now.return_value=datetime(2026,11,5,21,0)
             bot.wait_for_window()
-            sleep.assert_called_once_with(1800)
+            sleep.assert_called_once_with(datetime(2026,11,5,21,30).timestamp())
             sleep.reset_mock()
             clock.now.return_value=datetime(2026,11,5,21,30)
             bot.wait_for_window()

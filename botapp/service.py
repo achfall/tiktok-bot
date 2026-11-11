@@ -11,11 +11,13 @@ import tempfile
 import threading
 import urllib.request
 from dotenv import dotenv_values, set_key
+from botapp import API_VERSION
 
 CODE_ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(CODE_ROOT/'scripts'))
-from bot_settings import FIELDS, LOCK, load_document, save_document, effective_settings, validate_values
+from bot_settings import FIELDS, configuration_lock, load_document, save_document, effective_settings, validate_values
 from botapp.jobs import Jobs
+from diagnostic_options import MIN_LEAD_MINUTES, MAX_SCHEDULE_DAYS, SCHEDULE_STEP_MINUTES
 from account_sources import source as account_source, read_ids, save_ids
 
 NAME=re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}')
@@ -83,6 +85,10 @@ class ControlService:
                 LEFT JOIN accounts u ON u.id=c.used_by LEFT JOIN accounts o ON o.id=p.account_id
                 ORDER BY c.id DESC LIMIT 250''')]
             history=[dict(r) for r in conn.execute('SELECT l.*,a.slug account,p.folder_name product FROM posts_log l JOIN accounts a ON a.id=l.account_id LEFT JOIN products p ON p.id=l.product_id ORDER BY l.id DESC LIMIT 150')]
+            from schedule_store import history_metadata
+            metadata=history_metadata(conn,[row['id'] for row in history])
+            for row in history:
+                row.update(metadata.get(row['id'],{}))
             stats={r['status']:r['n'] for r in conn.execute('SELECT status,COUNT(*) n FROM contents GROUP BY status')}
             for p in products:
                 p['available']=conn.execute("SELECT COUNT(*) FROM contents WHERE status='unused' AND ((source_folder IS NOT NULL AND source_folder=?) OR (source_folder IS NULL AND product_id=?))",(p['folder_path'],p['id'])).fetchone()[0]
@@ -116,7 +122,7 @@ class ControlService:
         env=dotenv_values(self.base/'.env')
         for row in history:
             if row['error_message']:row['error_message']=self.redact(row['error_message'])
-        return {'api_version':1,'schema':FIELDS,'accounts':accounts,'concepts':concepts,'products':products,'queue':queue,'history':history,'stats':stats,'runs':runs,'config':config,'effective':effective_settings(self.base),'keys':{k:bool(env.get(k)) for k in KEYS},'local_time':datetime.now().isoformat(timespec='seconds'),'root':str(self.base),'scheduler_note':'Jadwal berjalan saat panel lokal aktif. Mac harus menyala, login, dan tidak sleep. Jadwal terlewat tidak dijalankan otomatis.'}
+        return {'diagnostics':{'schedule_min_lead_minutes':MIN_LEAD_MINUTES,'schedule_max_days':MAX_SCHEDULE_DAYS,'schedule_step_minutes':SCHEDULE_STEP_MINUTES},'api_version':API_VERSION,'schema':FIELDS,'accounts':accounts,'concepts':concepts,'products':products,'queue':queue,'history':history,'stats':stats,'runs':runs,'config':config,'effective':effective_settings(self.base),'keys':{k:bool(env.get(k)) for k in KEYS},'local_time':datetime.now().isoformat(timespec='seconds'),'root':str(self.base),'scheduler_note':'Jadwal berjalan saat panel lokal aktif. Saat Mac sleep, proses aktif tertunda dan lanjut otomatis setelah bangun. Internet harus tersedia. Jadwal mulai yang terlewat tidak dijalankan otomatis.'}
 
     def create_account(self,data):
         name=str(data.get('name','')).strip();concept=str(data.get('concept','')).strip()
@@ -135,7 +141,7 @@ class ControlService:
     def update_account(self,data):
         slug=data.get('account');self.account(slug);self.idle(slug)
         mode=data.get('mode')
-        if mode not in ('auto','manual_review'):raise ValueError('Mode tidak valid.')
+        if mode not in ('auto','manual_review','schedule'):raise ValueError('Mode tidak valid.')
         values=None
         if 'values' in data:
             values=validate_values(data['values'],partial=True)
@@ -145,12 +151,19 @@ class ControlService:
         concept=data.get('concept')
         if concept and concept!=self.account(slug)['concept']:
             self.command('manage_concepts.py','assign',slug,concept)
-        result=self.command('setup_account.py',slug,'--publish-mode',mode)
-        if values is not None:
-            with LOCK:
-                config=load_document(self.base)
+        with configuration_lock(self.base):
+            config=load_document(self.base)
+            import copy
+            previous=copy.deepcopy(config)
+            if values is not None:
                 config.setdefault('accounts',{}).setdefault(slug,{}).update(values)
                 save_document(self.base,config)
+            try:
+                self.command('setup_account.py',slug,'--publish-mode',mode)
+            except BaseException:
+                if values is not None:
+                    save_document(self.base,previous)
+                raise
         return 'Pengaturan akun disimpan. Berlaku untuk proses berikutnya.'
 
     def create_concept(self,data):
@@ -206,8 +219,9 @@ class ControlService:
         account=data.get('account')
         if account:
             self.account(account)
+            self.idle(account)
             if any(next(f for f in FIELDS if f['key']==key)['group']!='orchestrator' for key in values):raise ValueError('Pengaturan provider caption bersifat global.')
-        with LOCK:
+        with configuration_lock(self.base):
             config=load_document(self.base)
             if account:config.setdefault('accounts',{})[account]=values
             else:config['values']=values
@@ -223,7 +237,7 @@ class ControlService:
         runtime=effective_settings(self.base,slug)
         if int(clock[:2])*60+int(clock[3:])<runtime['window_start_hour']*60+runtime['window_start_minute']:
             raise ValueError('Jam jadwal mendahului jendela posting. Ubah jam mulai di pengaturan orchestrator akun dahulu.')
-        with LOCK:
+        with configuration_lock(self.base):
             config=load_document(self.base)
             config.setdefault('schedules',{})[slug]={'days':sorted(set(days)),'time':clock,'enabled':enabled}
             save_document(self.base,config)
@@ -235,7 +249,7 @@ class ControlService:
         values={key:value.strip() for key,value in values.items() if isinstance(value,str) and value.strip()}
         if any(len(v)>1024 or '\n' in v or '\r' in v for v in values.values()):raise ValueError('Format API key tidak valid.')
         if not values:return 'Tidak ada API key yang diubah.'
-        with LOCK:
+        with configuration_lock(self.base):
             self.base.mkdir(parents=True,exist_ok=True)
             fd,name=tempfile.mkstemp(prefix='.env-edit-',dir=self.base)
             try:
@@ -284,22 +298,30 @@ class ControlService:
     def start(self,data,scheduled_key=None):
         a=self.account(data.get('account'))
         kind=data.get('kind','configured')
+        if kind not in ('configured','draft_test','e2e_test'):raise ValueError('Jenis proses tidak valid.')
+        test_options=None
+        if kind=='e2e_test':
+            from diagnostic_options import validate_options
+            test_options=validate_options(data.get('test_options'))
+            if test_options['mode'] in ('auto','schedule') and data.get('confirmed') is not True:
+                raise ValueError('Konfirmasi publish/Schedule tes diperlukan.')
         if not a['active']:raise ValueError('Akun tidak aktif.')
         with closing(self.connection()) as conn:
             held=conn.execute("SELECT 1 FROM contents WHERE claimed_by=? AND status IN ('claimed','submitting','uncertain')",(a['id'],)).fetchone()
             if held:raise ValueError('Akun mempunyai video tertahan. Selesaikan pemeriksaan antrean dahulu.')
-        if kind=='configured' and a['publish_mode']=='auto' and data.get('confirmed') is not True:raise ValueError('Konfirmasi publish diperlukan.')
+        if kind=='configured' and a['publish_mode'] in ('auto','schedule') and data.get('confirmed') is not True:raise ValueError('Konfirmasi publish/Schedule diperlukan.')
         limit_count=data.get('limit')
         if limit_count is not None and (isinstance(limit_count,bool) or not isinstance(limit_count,int) or not 1<=limit_count<=100):raise ValueError('Batas proses 1–100.')
         content_id=None
-        if kind=='draft_test':
+        if kind in ('draft_test','e2e_test'):
             content_id=data.get('content_id')
-            if isinstance(content_id,bool) or not isinstance(content_id,int) or content_id<1:raise ValueError('Pilih video untuk tes draft.')
+            if isinstance(content_id,bool) or not isinstance(content_id,int) or content_id<1:raise ValueError('Pilih video untuk tes.')
             with closing(self.connection()) as conn:
                 row=conn.execute('SELECT file_path,source_folder,product_id FROM contents WHERE id=?',(content_id,)).fetchone()
                 products=conn.execute('SELECT id,folder_path FROM products WHERE account_id=? AND active=1',(a['id'],)).fetchall()
             if not row or not Path(row['file_path']).is_file() or not any(row['source_folder']==p['folder_path'] if row['source_folder'] else row['product_id']==p['id'] for p in products):raise ValueError('Video tes tidak tersedia untuk akun ini.')
-        return {'run_id':self.jobs.launch(a['slug'],kind,limit_count,content_id,scheduled_key),'message':'Proses dimulai. Pantau log; jangan jalankan akun yang sama lewat Terminal bersamaan.'}
+        options={'test_options':test_options} if kind=='e2e_test' else {}
+        return {'run_id':self.jobs.launch(a['slug'],kind,limit_count,content_id,scheduled_key,**options),'message':'Proses dimulai. Pantau log; jangan jalankan akun yang sama lewat Terminal bersamaan.'}
 
     def resolve(self,data):
         if data.get('checked') is not True:raise ValueError('Periksa TikTok dan hentikan proses akun sebelum rekonsiliasi.')
@@ -307,7 +329,7 @@ class ControlService:
             row=conn.execute('SELECT a.slug FROM contents c JOIN accounts a ON a.id=c.claimed_by WHERE c.id=?',(data.get('id'),)).fetchone()
         if row and self.jobs.active(row['slug']):raise ValueError('Proses akun masih aktif. Hentikan sebelum rekonsiliasi.')
         result=data.get('result')
-        if result not in ('success','draft','not-posted'):raise ValueError('Hasil pemeriksaan tidak valid.')
+        if result not in ('success','draft','scheduled','not-posted'):raise ValueError('Hasil pemeriksaan tidak valid.')
         return self.command('manage_queue.py','resolve',int(data['id']),'--result',result,'--checked-tiktok')
 
     def open_folder(self,data):

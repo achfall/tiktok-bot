@@ -12,11 +12,13 @@ DB_PATH=PROJECT_ROOT/'db/tiktok_bot.db'
 
 
 def resolve(conn, content_id, result):
-    if result in ('success','draft'):
+    if result in ('success','draft','scheduled'):
         row=conn.execute('SELECT claim_product_id,claimed_by,file_path,claim_token,status FROM contents WHERE id=?',(content_id,)).fetchone()
         if not row or row[4] not in ('submitting','uncertain'):raise ValueError('Video bukan submit tertahan')
         claim=Claim(content_id,row[0],row[1],row[2],row[3])
-        finish_success(conn,claim,'auto' if result=='success' else 'manual')
+        from schedule_store import attach
+        attach(conn)
+        finish_success(conn,claim,{'success':'auto','draft':'manual','scheduled':'schedule'}[result])
         archive_after_success(conn,content_id)
         return
     with transaction(conn):
@@ -29,7 +31,7 @@ def resolve(conn, content_id, result):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='action',required=True);sub.add_parser('list')
-    r=sub.add_parser('resolve');r.add_argument('content_id',type=int);r.add_argument('--result',choices=['success','draft','not-posted'],required=True)
+    r=sub.add_parser('resolve');r.add_argument('content_id',type=int);r.add_argument('--result',choices=['success','draft','scheduled','not-posted'],required=True)
     r.add_argument('--checked-tiktok',action='store_true',help='Operator sudah memeriksa TikTok dan menghentikan proses akun terkait')
     args=parser.parse_args()
     with sqlite3.connect(DB_PATH.as_uri()+'?mode=rw',uri=True,timeout=30) as conn:

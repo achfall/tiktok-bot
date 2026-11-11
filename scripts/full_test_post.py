@@ -123,6 +123,7 @@ def mark_used_and_log(item, status, error_message=None):
 
 
 def main():
+    raise SystemExit('Script upload lama dinonaktifkan; gunakan panel atau daily_orchestrator.py --publish --retest-content ID --test-draft.')
     if len(sys.argv) < 2:
         print("Usage: python3 full_test_post.py <account_slug> [--publish]")
         sys.exit(1)
@@ -264,8 +265,4 @@ def main():
 
 
 if __name__ == "__main__":
-    with sqlite3.connect(Path(DB_PATH).as_uri() + "?mode=ro", uri=True) as check:
-        columns = {row[1] for row in check.execute("PRAGMA table_info(accounts)")}
-        if "content_group_id" in columns and check.execute("SELECT 1 FROM accounts WHERE content_group_id IS NOT NULL").fetchone():
-            raise SystemExit("Script lama tidak mendukung antrean konsep; gunakan daily_orchestrator.py.")
     main()

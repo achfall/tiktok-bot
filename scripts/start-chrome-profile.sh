@@ -13,11 +13,11 @@ LOG_FILE="$BOT_ROOT/logs/${PROFILE_NAME}.log"
 
 # DB menyimpan lokasi profil; ID akun dan nama folder dapat berbeda.
 RESOLVER="$(dirname "$0")/chrome_profile_path.py"
-if [[ -f "$RESOLVER" ]]; then
-  PYTHON_BIN="${TIKTOK_BOT_PYTHON:-$BOT_ROOT/venv/bin/python}"
-  [[ -x "$PYTHON_BIN" ]] || PYTHON_BIN="$(command -v python3)"
-  PROFILE_DIR="$("$PYTHON_BIN" "$RESOLVER" "$PROFILE_NAME" "$CDP_PORT")"
-fi
+[[ -f "$RESOLVER" ]] || { echo "Resolver profil tidak ditemukan" >&2; exit 1; }
+PYTHON_BIN="${TIKTOK_BOT_PYTHON:-$BOT_ROOT/venv/bin/python}"
+[[ -x "$PYTHON_BIN" ]] || PYTHON_BIN="$(command -v python3)"
+PROFILE_DIR="$("$PYTHON_BIN" "$RESOLVER" "$PROFILE_NAME" "$CDP_PORT")"
+PROFILE_DIRECTORY="$("$PYTHON_BIN" "$RESOLVER" "$PROFILE_NAME" "$CDP_PORT" --directory)"
 
 if [[ "$(uname -s)" == Darwin ]]; then
   CHROME_BIN="${CHROME_BIN:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
@@ -29,6 +29,7 @@ mkdir -p "$PROFILE_DIR" "$(dirname "$LOG_FILE")"
 
 CHROME_ARGS=(
   --user-data-dir="$PROFILE_DIR"
+  --profile-directory="$PROFILE_DIRECTORY"
   --remote-debugging-port="$CDP_PORT"
   --remote-debugging-address=127.0.0.1
   --remote-allow-origins=http://127.0.0.1:$CDP_PORT
@@ -47,5 +48,5 @@ else
   "$CHROME_BIN" "${CHROME_ARGS[@]}" > "$LOG_FILE" 2>&1 &
   echo "Chrome profile '$PROFILE_NAME' started (PID $!)"
 fi
-echo "Profile folder: $PROFILE_DIR"
+echo "Profile folder: $PROFILE_DIR/$PROFILE_DIRECTORY"
 echo "CDP endpoint: http://127.0.0.1:$CDP_PORT"

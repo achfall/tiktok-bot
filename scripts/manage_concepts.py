@@ -62,7 +62,7 @@ def assign(conn, account, name, base, move_existing=False):
                         relative = Path(file).relative_to(old)
                         conn.execute('UPDATE contents SET source_folder=?,file_path=? WHERE id=?', (str(new),str(new/relative),cid))
                         if status == 'used':
-                            conn.execute("UPDATE contents SET used_by=COALESCE(used_by,(SELECT account_id FROM posts_log WHERE content_id=? AND status IN ('success','draft') ORDER BY id DESC LIMIT 1)) WHERE id=?", (cid,cid))
+                            conn.execute("UPDATE contents SET used_by=COALESCE(used_by,(SELECT account_id FROM posts_log WHERE content_id=? AND status IN ('success','draft','scheduled') ORDER BY id DESC LIMIT 1)) WHERE id=?", (cid,cid))
                 else:
                     # Pindah anggota grup tidak memindahkan stok/arsip grup lama.
                     new.mkdir(parents=True,exist_ok=True)

@@ -53,3 +53,27 @@ dialog.account-dialog{width:min(740px,calc(100% - 28px));max-height:calc(100dvh 
 .schedule-card{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,.7fr) 190px;gap:20px}
 .schedule-card>.flex-row,.schedule-card>.flex-row>div{min-width:0}.schedule-card>.flex-row strong{overflow-wrap:anywhere}.schedule-card>.actions{justify-content:flex-end}.schedule-time{font-variant-numeric:tabular-nums}
 @media(max-width:900px){.schedule-card{grid-template-columns:minmax(0,1fr) 150px;gap:14px}.schedule-card>.flex-row{grid-column:1/-1}.schedule-card>.actions{justify-self:end}.schedule-card>.actions .button{padding:8px 10px}}
+
+/* Riwayat dan proses */
+.history-page .panel-heading{padding:18px 22px}.history-count{font-size:10px;color:var(--muted);white-space:nowrap}.history-page .run-item{display:grid;grid-template-columns:36px minmax(0,1fr) 120px 190px;align-items:center;gap:14px;padding:16px 22px}.history-page .run-item:last-child{border-bottom:0}.history-page .run-item .avatar{width:36px;height:36px;font-size:11px}.run-info{min-width:0}.run-info>strong{display:block;font-size:12px;font-weight:650;overflow-wrap:anywhere}.run-meta{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:10px;color:var(--muted);margin-top:4px}.history-page .run-item .actions{justify-content:flex-end;flex-wrap:nowrap}.run-active{background:#fbfdf7}.runs-idle{display:flex;align-items:center;gap:13px;padding:24px 22px;color:#6c805c}.runs-idle>svg{padding:9px;box-sizing:content-box;background:#edf5e1;border-radius:50%;width:18px;height:18px}.runs-idle strong{font-size:12px;color:#47613c}.runs-idle p{font-size:11px;margin:4px 0 0;color:var(--muted)}.history-table{table-layout:fixed;min-width:600px}.history-table th:first-child{width:32%}.history-table th:nth-child(2){width:20%}.history-table th:nth-child(3){width:22%}.history-table th:last-child{width:26%}.history-table td{vertical-align:top;padding:16px 22px}.history-table td:first-child{overflow-wrap:anywhere}.history-table .subtext{margin-top:5px;line-height:1.6}.history-time{font-size:10px;color:#6d7b66;font-variant-numeric:tabular-nums}.history-muted{color:#a6afa0}.history-note{font-size:10px}.history-note summary{cursor:pointer;color:#6b805b;font-weight:600}.history-note>div{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7;margin-top:9px;padding:10px;border:1px solid #efdfd6;background:#fff8f4;border-radius:6px;color:#925342}.history-footnote{font-size:10px;color:var(--muted);margin:-6px 2px 0;line-height:1.7}
+@media(max-width:1000px){.history-page .run-item{grid-template-columns:36px minmax(0,1fr) auto}.history-page .run-status{grid-column:3;grid-row:1}.history-page .run-item .actions{grid-column:2/-1;justify-content:flex-start}.history-page .run-item{gap:10px 12px}}
+@media(max-width:600px){.history-page .panel-heading{padding:16px}.history-page .run-item{padding:16px;grid-template-columns:30px minmax(0,1fr)}.history-page .run-item .avatar{width:30px;height:30px;border-radius:9px;font-size:10px}.history-page .run-status{grid-column:2;grid-row:auto}.history-page .run-item .actions{grid-column:2}.run-meta{gap:3px 8px}.runs-idle{padding:20px 16px}.history-table td,.history-table th{padding:14px 16px}}
+
+.output-mode-options{grid-template-columns:repeat(3,minmax(0,1fr))}
+#schedule-output-settings[hidden],#immediate-post-settings[hidden]{display:none}
+#schedule-output-settings,#immediate-post-settings{margin-top:16px;border-top:1px solid var(--line);padding-top:16px}
+
+/* Halaman pendukung: stok, antrean dan jadwal mulai dalam satu navigasi. */
+.content-tabs{display:flex;gap:5px;padding:5px;margin:0 0 22px;background:#edf1e7;border:1px solid var(--line);border-radius:12px;width:fit-content;max-width:100%}
+.content-tabs a{display:flex;align-items:center;gap:8px;padding:11px 18px;color:#6c7d65;text-decoration:none;border-radius:8px;font-size:12px;font-weight:600;white-space:nowrap;transition:background .15s,color .15s}
+.content-tabs a:hover{background:#e2e9d9;color:var(--ink)}
+.content-tabs a.active{background:var(--ink);color:white;box-shadow:0 2px 5px #172f291c}
+.content-tabs a:focus-visible{outline:2px solid #63894b;outline-offset:2px}
+.content-tabs svg{width:16px;height:16px}
+.content-tab-count{display:inline-flex;justify-content:center;align-items:center;min-width:19px;height:19px;padding:0 4px;border-radius:5px;background:#f5dfc9;color:#995128;font-size:10px}
+.content-section-heading{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:0 0 18px}
+.content-section-heading>div:first-child{min-width:0}
+.content-section-heading h2{margin:0 0 5px;font-size:17px;font-weight:650;color:var(--ink)}
+.content-section-heading p{margin:0;color:var(--muted);font-size:11px;line-height:1.6}
+.content-section-heading .actions{flex-shrink:0}
+@media(max-width:600px){.content-tabs{width:100%;gap:2px;padding:4px;box-sizing:border-box}.content-tabs a{flex:1;justify-content:center;gap:5px;padding:10px 6px;font-size:10px}.content-tabs svg{display:none}.content-section-heading{align-items:flex-start;flex-direction:column;gap:12px}.content-section-heading .actions{align-self:flex-end}}

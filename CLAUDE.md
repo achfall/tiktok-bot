@@ -25,7 +25,7 @@ tail -f logs/akun1-service.log
 
 Unit files: `~/.config/systemd/user/tiktokbot-akunN.{service,timer}`. The service runs `start-chrome-profile.sh akunN <port>` then `daily_orchestrator.py akunN --publish`; the timer restarts it daily at 10:00. CDP port convention: `9220 + N` (akun1=9221 … akun4=9224). A new account needs its own service + timer copied from the existing pattern.
 
-Manual / testing (these hit the real TikTok account — only `none` mode is side-effect free):
+Manual commands below access real Chrome/TikTok or AI providers. Orchestrator `none` also uploads a real video; it only skips the final submission. Use isolated unit tests for development:
 
 ```bash
 scripts/start-chrome-profile.sh akun1 9221                  # launch Chrome for a profile with CDP
@@ -49,14 +49,14 @@ python3 scripts/manage_products.py list|add|disable|enable|set-id akun1 "<folder
 
 **`scripts/daily_orchestrator.py`** is the production core:
 - Picks active products not yet posted today (per `posts_log`), in `sort_order`, capped at `DEFAULT_MAX_PER_DAY`; for each, takes the first `unused` video.
-- Mode comes from the DB, not only the CLI: no `--publish` → `none` (test one product); `publish_mode='auto'` → clicks **Post**; anything else (`manual_review`) → clicks **Save draft**. Videos are marked used once posted *or* drafted.
+- Mode comes from the DB, not only the CLI: no `--publish` → `none` (test one product); `publish_mode='auto'` → clicks **Post**; `manual_review` → **Save draft**; `schedule` → native **Schedule**. Unknown modes and inactive accounts are rejected. Videos are marked used once posted *or* drafted.
 - Waits for the posting window (from 10:00) and sleeps a random 35–50 min between posts.
 - Failure policy: each UI step retries once (`find_with_retry`); any `StepFailed` or caption-generation failure is logged and **stops the whole day** (no skip-and-continue). The systemd timer is what resumes it the next day.
-- `post_one_video` opens a fresh tab via `/json/new`, locates elements with injected JS returning bounding-box centers, then clicks/types with `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` / `Input.insertText`. Caption is pasted via clipboard. Step 5b handles accounts whose link popup has a "My Shop / Showcase products" toggle. Success is detected by the post-action redirect URL (`tiktokstudio/content` or `tab=draft`).
+- `post_one_video` opens a fresh tab via `/json/new`, locates elements with injected JS returning bounding-box centers, then clicks/types with `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` / `Input.insertText`. Caption is inserted with Input.insertText without clipboard permission. Step 5b handles accounts whose link popup has a "My Shop / Showcase products" toggle. Publish/draft success uses the post-action redirect; Schedule also requires a matching caption, schedule marker, date and time in Posts.
 
 **`scripts/caption_generator.py`**: Gemini first, DeepSeek fallback, called via plain HTTP. `caption_style='generic'` produces brand-free promo captions; `'product_name'` produces pain-point → solution → CTA captions using the folder name. Recent captions are fed into the prompt and checked against `captions_history` for uniqueness.
 
-**Selector knowledge** was discovered step by step in `scripts/mapping/step*.py` (standalone exploratory scripts, hardcoded to port 9221). `full_test_post.py` and `test_save_draft.py` are older standalone end-to-end tests that duplicate the pipeline logic. When TikTok's UI changes, the fix belongs in `daily_orchestrator.py`; the other scripts will not stay in sync.
+**Selector knowledge** was discovered step by step in `scripts/mapping/step*.py` (standalone exploratory scripts, hardcoded to port 9221). `full_test_post.py` and `test_save_draft.py` are archived reference code; their entrypoints are disabled because they bypass current queue and quota rules. When TikTok's UI changes, the fix belongs in `daily_orchestrator.py`; the other scripts will not stay in sync.
 
 `chrome-profiles/akunN/` are logged-in Chrome user-data dirs — never delete or reset them (that logs the account out).
 

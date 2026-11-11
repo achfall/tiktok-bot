@@ -14,7 +14,7 @@ BASE = PROJECT_ROOT
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('account', help='akun1, akun2, dst.')
-    parser.add_argument('--publish-mode', choices=['auto', 'manual_review'], help='Ubah aksi akhir, tanpa menjalankan bot')
+    parser.add_argument('--publish-mode', choices=['auto', 'manual_review', 'schedule'], help='Ubah aksi akhir, tanpa menjalankan bot')
     parser.add_argument('--name', help='Nama TikTok untuk folder Chrome dan video akun baru')
     parser.add_argument('--concept', help='Konsep konten untuk akun baru (buat konsep dahulu)')
     args = parser.parse_args()

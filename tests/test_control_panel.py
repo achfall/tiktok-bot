@@ -57,7 +57,7 @@ class PanelTests(unittest.TestCase):
     def test_state_static_api_and_keys_are_masked(self):
         status,headers,body=self.request('/api/v1/state')
         self.assertEqual(status,200);state=json.loads(body)
-        self.assertEqual(state['api_version'],1)
+        self.assertEqual(state['api_version'],2)
         self.assertEqual(state['accounts'][0]['name'],'infosehat.ofc')
         self.assertIs(state['keys']['GEMINI_API_KEY'],True)
         self.assertNotIn(b'secret-sentinel',body)
@@ -70,6 +70,28 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(self.request('/api/v1/concepts/create','POST',{'name':'evil'},headers={'X-Panel-Token':''})[0],403)
         self.assertEqual(self.request('/api/v1/state',headers={'Host':'evil.example'})[0],403)
         self.assertFalse((self.base/'content/evil').exists())
+
+    def test_schedule_mode_http_settings_and_confirmation_without_launch(self):
+        status,_,body=self.request('/api/v1/accounts/update','POST',{'account':'akun1','mode':'schedule','values':{'schedule_start_hour':17,'schedule_start_minute':30,'schedule_interval_minutes':30}})
+        self.assertEqual(status,200,body)
+        state=json.loads(self.request('/api/v1/state')[2])
+        self.assertEqual(state['api_version'],2)
+        self.assertEqual(state['accounts'][0]['publish_mode'],'schedule')
+        self.assertEqual(state['accounts'][0]['settings']['schedule_interval_minutes'],30)
+        self.assertEqual(self.request('/api/v1/runs/start','POST',{'account':'akun1','kind':'configured'})[0],400)
+        self.assertEqual(self.service.jobs.list(),[])
+
+    def test_low_disk_upload_is_rejected_before_writing_video(self):
+        with patch('botapp.server.shutil.disk_usage',return_value=SimpleNamespace(free=1)):
+            status,_,body=self.request('/api/v1/upload?product=1','POST',headers={'X-File-Name':'new.mp4'},raw=b'video')
+        self.assertEqual(status,400,body)
+        self.assertFalse((self.folder/'new.mp4').exists())
+        self.assertEqual(list(self.folder.glob('.upload-*')),[])
+
+    def test_settings_endpoint_cannot_change_running_account(self):
+        with closing(self.service.jobs.connect()) as conn,conn:
+            conn.execute("INSERT INTO runs(id,account,kind,status,created_at,log_path) VALUES('fixture-running','akun1','configured','running','2026-01-01','unused.log')")
+        self.assertEqual(self.request('/api/v1/settings','POST',{'account':'akun1','values':{'max_per_day':2}})[0],400)
 
     def test_concept_account_product_services_use_real_cli_with_isolated_data(self):
         self.service.create_concept({'name':'konten-ai'})
@@ -152,6 +174,20 @@ class PanelTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.service.update_account({'account':'akun1','mode':'manual_review','values':{'max_per_day':7}})
         self.assertEqual(effective_settings(self.base,'akun1'),before)
         self.assertEqual(self.service.account('akun1')['publish_mode'],'auto')
+
+    def test_e2e_http_requires_explicit_real_submit_confirmation(self):
+        (self.folder/'video.mp4').write_bytes(b'video')
+        self.service.scan({'account':'akun1'})
+        data={'account':'akun1','kind':'e2e_test','content_id':1,'test_options':{'mode':'auto','music':'off'}}
+        with patch('botapp.jobs.subprocess.Popen') as process:
+            process.return_value.poll.return_value=None
+            self.assertEqual(self.request('/api/v1/runs/start','POST',data)[0],400)
+            self.assertEqual(self.request('/api/v1/runs/start','POST',{**data,'test_options':{'mode':'schedule'}})[0],400)
+            process.assert_not_called()
+            status,_,body=self.request('/api/v1/runs/start','POST',{**data,'confirmed':True})
+            self.assertEqual(status,200,body)
+            process.assert_called_once()
+        self.assertEqual(self.service.account('akun1')['publish_mode'],'manual_review')
 
     def test_accounts_can_share_the_same_limits_and_start_time(self):
         self.service.create_account({'name':'same-settings.id'})
@@ -268,7 +304,7 @@ class PanelTests(unittest.TestCase):
         fixture.write_text(json.dumps(self.service.state()))
         result=subprocess.run(['osascript','-l','JavaScript',str(ROOT/'tests/ui_smoke.js'),str(ROOT),str(fixture)],capture_output=True,text=True,timeout=15)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertIn('8 halaman',result.stdout)
+        self.assertIn('6 menu, 3 tab',result.stdout)
 
     def test_open_account_folder_without_product_ids(self):
         self.service.create_account({'name':'new-folder.id'})

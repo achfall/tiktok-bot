@@ -17,8 +17,21 @@ function run(argv) {
   var code=source+'\nreturn {state:function(s){S=s;token="smoke";},readSettings:readSettings,render:render,sourceIds:sourceIds,newAccount:newAccount,newConcept:newConcept,editAccount:editAccount,accountRuntime:accountRuntime,newProduct:newProduct,editProduct:editProduct,upload:upload,schedule:schedule,start:start,testDraft:testDraft,renameConcept:renameConcept,assignConcept:assignConcept};';
   var app=new Function('document','window','location','fetch','setInterval','setTimeout','clearTimeout',code)(document,window,location,fetch,function(){},function(){},function(){});
   app.state(state);
-  var pages=['overview','accounts','products','queue','schedules','history','diagnostics','settings'];
+  var pages=['overview','accounts','history','content/products','content/queue','content/schedules','diagnostics','settings'];
   pages.forEach(function(page){location.hash='#'+page;app.render();if(node('#main').innerHTML.indexOf('<h1>')<0)throw Error('Heading missing: '+page);if(node('#navigation').innerHTML.indexOf('aria-current="page"')<0)throw Error('Active nav missing: '+page);});
+  var navigation=node('#navigation').innerHTML;
+  var order=['#overview','#accounts','#history','#content','#diagnostics','#settings'];
+  order.forEach(function(path,index){if(navigation.indexOf('href="'+path+'"')<0||(index&&navigation.indexOf('href="'+path+'"')<navigation.indexOf('href="'+order[index-1]+'"')))throw Error('Sidebar order incorrect: '+path);});
+  ['products','queue','schedules'].forEach(function(tab){
+    if(navigation.indexOf('href="#'+tab+'"')>=0)throw Error('Supporting pages must not be separate sidebar menus');
+    location.hash='#content/'+tab;app.render();
+    var html=node('#main').innerHTML;
+    if((html.match(/<h1>/g)||[]).length!==1)throw Error('Combined page must have one main heading');
+    if(html.indexOf('href="#content/'+tab+'" class="active" aria-current="page"')<0)throw Error('Active content tab missing: '+tab);
+    location.hash='#'+tab;app.render();
+    if(node('#main').innerHTML.indexOf('href="#content/'+tab+'" class="active" aria-current="page"')<0)throw Error('Legacy route broken: '+tab);
+  });
+  location.hash='#settings';app.render();
   if(node('#navigation').innerHTML.indexOf('#concepts')>=0)throw Error('Concept menu must be removed');
   var globalSettings=node('#main').innerHTML;
   if(globalSettings.indexOf('Orchestrator')>=0||globalSettings.indexOf('id="settings-form"')>=0||globalSettings.indexOf('name="max_per_day"')>=0)throw Error('Per-account settings must not appear on the global settings page');
@@ -49,7 +62,11 @@ function run(argv) {
   if(settings.indexOf('name="min_interval_minutes" type="number"')<0&&settings.indexOf('name="min_interval_minutes"')<0)throw Error('Interval missing');
   if(settings.indexOf('min="60"')<0)throw Error('Minimum interval must be 60 minutes');
   if(settings.indexOf('name="confirmed"')>=0||settings.indexOf('<select name="mode"')>=0)throw Error('Mode should use direct choices without confirmation');
-  if((settings.match(/type="radio" name="mode"/g)||[]).length!==2||settings.indexOf('value="manual_review" checked')<0)throw Error('Both mode choices and current selection must be visible');
+  if((settings.match(/type="radio" name="mode"/g)||[]).length!==3||settings.indexOf('value="manual_review" checked')<0)throw Error('Three mode choices and current selection must be visible');
+  if(settings.indexOf('value="schedule"')<0||settings.indexOf('name="schedule_start_hour"')<0||settings.indexOf('name="schedule_interval_minutes"')<0)throw Error('Schedule mode and clock settings missing');
+  var scheduleClock={elements:{namedItem:function(key){return key==='schedule_start_hour'?{value:'17:30'}:null;}}};
+  var scheduleParsed=app.readSettings(scheduleClock);
+  if(scheduleParsed.schedule_start_hour!==17||scheduleParsed.schedule_start_minute!==30)throw Error('Schedule clock parsing failed');
   if(settings.indexOf('class="settings-fields"')<0||settings.indexOf('value="10:00"')<0||settings.indexOf('placeholder="10:00 atau 21:00"')<0)throw Error('Compact settings and clock format missing');
   if(settings.indexOf('name="window_start_minute"')>=0)throw Error('Minutes should be part of the clock input');
   if(settings.indexOf('name="music_enabled" value="false" checked')<0||settings.indexOf('name="music_enabled" value="true"')<0)throw Error('Music toggle must default off');
@@ -73,5 +90,5 @@ function run(argv) {
   if(node('#main').innerHTML.indexOf('<b>jingsu</b>')>=0||node('#main').innerHTML.indexOf('&lt;b&gt;jingsu&lt;/b&gt;')<0)throw Error('Card product name must be escaped');
   location.hash='#overview';app.render();
   if(node('#main').innerHTML.indexOf('#concepts')>=0||node('#main').innerHTML.indexOf('Konsep konten')>=0)throw Error('Overview must not expose concept navigation');
-  return '8 halaman dan 11 dialog dirender; escaping teks pengguna OK (DOM stub).';
+  return '6 menu, 3 tab, dan 11 dialog dirender; rute lama dan escaping OK (DOM stub).';
 }

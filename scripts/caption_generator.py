@@ -81,14 +81,15 @@ def call_gemini(prompt):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY belum diisi")
     from google import genai
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    from google.genai import types
     from bot_settings import load_document, effective_settings
     config = load_document(BASE_DIR)
     model = effective_settings(BASE_DIR)['gemini_model'] if 'gemini_model' in config.get('values', {}) else GEMINI_MODEL
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-    )
+    client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=60000))
+    try:
+        response = client.models.generate_content(model=model, contents=prompt)
+    finally:
+        client.close()
     text = (response.text or "").strip()
     if not text:
         raise RuntimeError("Gemini balikin response kosong")
@@ -131,18 +132,18 @@ def generate_unique_caption(cur, account_id, product_name=None):
         print("Coba generate pakai Gemini...")
         caption = call_gemini(prompt)
     except Exception as e:
-        print(f"Gemini gagal: {e}")
+        print(f"Gemini gagal ({type(e).__name__}).")
         print("Fallback ke DeepSeek...")
         try:
             caption = call_deepseek(prompt)
         except Exception as e2:
-            print(f"DeepSeek juga gagal: {e2}")
+            print(f"DeepSeek juga gagal ({type(e2).__name__}).")
             print("STOP -- kedua provider gagal, gak retry lagi.")
             return None
 
     if caption in recent:
-        print("WARNING: caption sama persis kayak history, tapi tetep dipakai"
-              " (retry policy kita cuma 1x alternatif, bukan loop).")
+        print('Caption duplikat; proses dihentikan sebelum upload.')
+        return None
 
     return caption
 

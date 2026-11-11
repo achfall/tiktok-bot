@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import json
 
 ACTIVE=('queued','running','stopping')
 
@@ -27,7 +28,9 @@ class Jobs:
                 CREATE UNIQUE INDEX IF NOT EXISTS one_running_account ON runs(account)
                   WHERE status IN ('queued','running','stopping');
                 CREATE UNIQUE INDEX IF NOT EXISTS one_schedule_occurrence ON runs(account,scheduled_key)
-                  WHERE scheduled_key IS NOT NULL;''')
+                  WHERE scheduled_key IS NOT NULL;
+                CREATE TABLE IF NOT EXISTS run_test_options (
+                  run_id TEXT PRIMARY KEY, options_json TEXT NOT NULL);''')
         self.children=[];self.lock=threading.Lock()
 
     def connect(self):
@@ -45,8 +48,11 @@ class Jobs:
             if account is not None:query+=' AND account=?';args=(account,)
             return [dict(row) for row in conn.execute(query,args)]
 
-    def launch(self,account,kind='configured',limit_count=None,content_id=None,scheduled_key=None):
-        if kind not in ('configured','draft_test'):raise ValueError('Jenis proses tidak valid.')
+    def launch(self,account,kind='configured',limit_count=None,content_id=None,scheduled_key=None,test_options=None):
+        if kind not in ('configured','draft_test','e2e_test'):raise ValueError('Jenis proses tidak valid.')
+        if kind=='e2e_test':
+            from diagnostic_options import validate_options
+            test_options=validate_options(test_options)
         run_id=uuid.uuid4().hex
         log_dir=self.base/'logs/panel';log_dir.mkdir(parents=True,exist_ok=True)
         log_path=log_dir/f'{run_id}.log'
@@ -54,6 +60,8 @@ class Jobs:
         try:
             with closing(self.connect()) as conn, conn:
                 conn.execute('INSERT INTO runs (id,account,kind,status,created_at,log_path,limit_count,content_id,scheduled_key) VALUES (?,?,?,\'queued\',?,?,?,?,?)',(run_id,account,kind,now,str(log_path),limit_count,content_id,scheduled_key))
+                if kind=='e2e_test':
+                    conn.execute('INSERT INTO run_test_options VALUES (?,?)',(run_id,json.dumps(test_options)))
         except sqlite3.IntegrityError:
             raise ValueError('Akun masih berjalan atau jadwal ini sudah pernah dijalankan.')
         env={**os.environ,'TIKTOK_BOT_HOME':str(self.base),'PYTHONUNBUFFERED':'1','TIKTOK_BOT_PYTHON':sys.executable}

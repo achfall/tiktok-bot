@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+echo "Launcher cron/tmux lama dinonaktifkan; gunakan panel atau orchestrator yang memakai slot Chrome." >&2
+exit 1
 # boot_start_all.sh
 # Dijalankan otomatis saat mesin boot (lewat cron @reboot).
 # Nyalain Chrome + tmux + orchestrator buat akun1-3 (akun4 belum ada

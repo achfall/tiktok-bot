@@ -29,8 +29,24 @@ def resolve(name, port):
     return root / name
 
 
+def directory(name, port):
+    from bot_settings import effective_settings
+    target = resolve(name, port)
+    account = name
+    db = BASE / 'db/tiktok_bot.db'
+    if db.is_file():
+        with sqlite3.connect(db.as_uri()+'?mode=ro', uri=True) as conn:
+            row = conn.execute('SELECT slug FROM accounts WHERE chrome_profile_path=?', (str(target),)).fetchone()
+            if row:
+                account = row[0]
+    selected = effective_settings(BASE, account)['chrome_profile_directory']
+    if selected != 'Default' and not (target / selected).is_dir():
+        raise ValueError('Profil internal yang dikunci tidak ditemukan; tidak membuat profil baru.')
+    return selected
+
+
 if __name__ == '__main__':
     try:
-        print(resolve(sys.argv[1], int(sys.argv[2])))
+        print(directory(sys.argv[1], int(sys.argv[2])) if '--directory' in sys.argv[3:] else resolve(sys.argv[1], int(sys.argv[2])))
     except (ValueError, sqlite3.Error) as error:
         raise SystemExit(str(error))

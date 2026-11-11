@@ -137,19 +137,58 @@ def require_claim(conn, claim, statuses):
     return row
 
 
-def begin_submission(conn, claim, caption):
+def daily_post_count(conn, account_id, quota_day=None):
+    """Kuota lokal akun: hasil selesai dan submit yang belum pasti ikut dihitung."""
+    from schedule_store import attach
+    if attach(conn):
+        return conn.execute(
+            "SELECT COUNT(*) FROM posts_log l LEFT JOIN schedule_meta.submissions s "
+            "ON s.log_id=l.id AND s.account_id=l.account_id AND s.content_id=l.content_id WHERE l.account_id=? "
+            "AND l.status IN ('success','draft','scheduled','submitting','uncertain') "
+            "AND COALESCE(s.quota_day,DATE(l.published_at,'localtime'))=COALESCE(?,DATE('now','localtime'))",
+            (account_id,quota_day),
+        ).fetchone()[0]
+    return conn.execute(
+        "SELECT COUNT(*) FROM posts_log WHERE account_id=? "
+        "AND status IN ('success','draft','scheduled','submitting','uncertain') "
+        "AND DATE(published_at,'localtime')=COALESCE(?,DATE('now','localtime'))",
+        (account_id,quota_day),
+    ).fetchone()[0]
+
+
+def begin_submission(conn, claim, caption, daily_limit=None, quota_day=None, scheduled=False, test_scheduled=False):
+    from schedule_store import attach
+    attach(conn)
     with transaction(conn):
         require_claim(conn, claim, ('claimed',))
+        if daily_limit is not None and daily_post_count(conn, claim.account_id, quota_day) >= daily_limit:
+            raise ValueError('Batas video hari ini sudah tercapai; submit tidak dilakukan.')
         log_id = conn.execute("INSERT INTO posts_log (account_id,product_id,content_id,caption_text,status,published_at) VALUES (?,?,?,?,'submitting',datetime('now'))", (claim.account_id,claim.product_id,claim.content_id,caption)).lastrowid
         conn.execute("UPDATE contents SET status='submitting',submission_log_id=? WHERE id=?", (log_id,claim.content_id))
+        if scheduled:
+            if not quota_day:
+                raise ValueError('Tanggal kuota batch Schedule belum ditetapkan.')
+            condition='batch_id=0' if test_scheduled else 'batch_id IN (SELECT id FROM schedule_meta.batches WHERE quota_day=?)'
+            args=(log_id,claim.account_id,claim.content_id) + (() if test_scheduled else (quota_day,))
+            changed=conn.execute('UPDATE schedule_meta.slots SET log_id=? WHERE account_id=? AND content_id=? AND log_id IS NULL AND '+condition,args).rowcount
+            if changed != 1:
+                raise ValueError('Slot Schedule belum disiapkan; submit dibatalkan.')
+            conn.execute('INSERT INTO schedule_meta.submissions(log_id,account_id,content_id,target_at,quota_day) '
+                         'SELECT ?,account_id,content_id,target_at,? FROM schedule_meta.slots WHERE log_id=?',
+                         (log_id,quota_day,log_id))
 
 
 def finish_success(conn, claim, mode):
-    if mode not in ('auto','manual'):
+    if mode not in ('auto','manual','schedule'):
         raise ValueError('Mode hasil posting tidak valid')
     with transaction(conn):
         _, log_id = require_claim(conn, claim, ('submitting','uncertain'))
-        conn.execute("UPDATE posts_log SET status=?,error_message=NULL,published_at=datetime('now') WHERE id=?", ('success' if mode=='auto' else 'draft',log_id))
+        if mode=='schedule':
+            if not conn.execute('SELECT 1 FROM schedule_meta.submissions WHERE log_id=? AND account_id=? AND content_id=?', (log_id,claim.account_id,claim.content_id)).fetchone():
+                raise ValueError('Metadata jadwal tidak tersedia; hasil harus diperiksa.')
+            conn.execute("UPDATE posts_log SET status='scheduled',error_message=NULL WHERE id=?", (log_id,))
+        else:
+            conn.execute("UPDATE posts_log SET status=?,error_message=NULL,published_at=datetime('now') WHERE id=?", ('success' if mode=='auto' else 'draft',log_id))
         conn.execute("UPDATE contents SET status='used',used_at=datetime('now'),used_by=?,claimed_by=NULL,claim_product_id=NULL,claim_token=NULL,claimed_at=NULL WHERE id=?", (claim.account_id,claim.content_id))
 
 
@@ -178,7 +217,9 @@ def prepare_retest(conn, account_id, product_id, original_id):
     if not product or not row or not Path(row[0]).is_file():
         raise ValueError('Video tes tidak tersedia')
     group = group_root(conn, account_id)
-    if (group and row[1] != product[0]) or (not group and row[2] != product_id):
+    flat = account_source(conn, account_id)
+    shared_source = bool(group or flat)
+    if (shared_source and row[1] != product[0]) or (not shared_source and row[2] != product_id):
         raise ValueError('Video tes bukan milik sumber akun')
     source = Path(row[0])
     target = Path(product[0]) / f'{source.stem}-tes-{uuid.uuid4().hex[:10]}{source.suffix}'
@@ -189,7 +230,7 @@ def prepare_retest(conn, account_id, product_id, original_id):
             created = True
             shutil.copyfileobj(src,dst)
         with transaction(conn):
-            cid = conn.execute("INSERT INTO contents (product_id,file_path,status,source_folder) VALUES (?,?,'unused',?)", (product_id,str(target),product[0] if group else None)).lastrowid
+            cid = conn.execute("INSERT INTO contents (product_id,file_path,status,source_folder) VALUES (?,?,'unused',?)", (product_id,str(target),product[0] if shared_source else None)).lastrowid
     except BaseException:
         if created:
             target.unlink(missing_ok=True)

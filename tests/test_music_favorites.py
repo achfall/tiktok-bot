@@ -2,8 +2,11 @@
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 from pathlib import Path
 import sqlite3
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,21 +14,28 @@ from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import music_favorites as music
+from upload_overlays import TOUR_BUTTON_CLOSE_JS
 
 TRACKS=[{'title':title,'detail':'00:30 · Artist '+title} for title in ['A','B','C']]
 
 
 class MusicSimulator:
-    def __init__(self,pages=None,save_loss=False):
+    def __init__(self,pages=None,save_loss=False,tour_after=(),tour_stuck=False):
         self.pages=pages if pages is not None else [TRACKS]
         self.page=0;self.timeline=[];self.saved=[];self.editor=False
         self.target=None;self.events=[];self.save_loss=save_loss
+        self.tour_after=set(tour_after);self.tour=False;self.tour_stuck=tour_stuck
 
     def point(self,target):
         self.target=target
         return {'x':1,'y':2}
 
     def read(self,ws,expression,mid):
+        if expression==TOUR_BUTTON_CLOSE_JS:
+            if not self.tour:return None
+            self.target='tour'
+            return {'x':100,'y':200,'label':'got it','text':'Preview your video on your phone'}
+        if self.tour:raise AssertionError('Music controls read while tour still blocks them')
         if expression==music.SOUNDS_JS:return self.point('open')
         if expression==music.FAVORITES_JS:return self.point('favorites')
         if expression==music.SAVE_EDITOR_JS:return self.point('save')
@@ -44,10 +54,16 @@ class MusicSimulator:
 
     def click(self,ws,x,y,mid):
         target=self.target;self.events.append(target)
+        if target=='tour':
+            if (x,y)!=(100,200):raise AssertionError('Music tour requires its button, not a backdrop click')
+            if not self.tour_stuck:self.tour=False
+            return mid+2
         if target=='open':self.editor=True;self.timeline=list(self.saved)
         elif target=='save':self.saved=[] if self.save_loss else list(self.timeline);self.editor=False
         elif target=='cancel':self.editor=False
         elif isinstance(target,dict):self.timeline.append(target['title'])
+        action='add' if isinstance(target,dict) else target
+        if action in self.tour_after:self.tour=True
         return mid+2
 
 
@@ -59,6 +75,31 @@ class MusicFavoritesTests(unittest.TestCase):
     def apply(self,sim,content_id=1):
         with patch.object(music.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
             return music.apply_favorite_music(None,1,self.base,'akun1',content_id,sim.read,sim.click)
+
+    @unittest.skipUnless(shutil.which('osascript'), 'Memerlukan JavaScriptCore macOS')
+    def test_save_click_uses_visible_area_and_rejects_obstruction(self):
+        # Jalankan selector asli pada geometri tombol yang terpotong, bukan
+        # simulator alur. Ini DOM stub, bukan verifikasi browser TikTok.
+        script = self.base/'save_geometry.js'
+        script.write_text('''function run() {
+          var window={innerWidth:1000,innerHeight:700}, blocked=false;
+          var rect={left:975,right:1100,top:20,bottom:70,width:125,height:50};
+          var button={innerText:'Save',disabled:false,
+            getAttribute:function(){return null;},scrollIntoView:function(){},
+            getBoundingClientRect:function(){return rect;},
+            contains:function(hit){return hit===this;}};
+          var document={querySelector:function(){return {querySelectorAll:function(){return [button];}};},
+            elementFromPoint:function(x,y){return !blocked && x>=0 && x<1000 && y>=0 && y<700 ? button : null;}};
+          function getComputedStyle(){return {visibility:'visible'};}
+          var expression=''' + json.dumps(music.SAVE_EDITOR_JS) + ''';
+          var partial=eval(expression);
+          blocked=true;var obstructed=eval(expression);
+          blocked=false;rect.left=1010;rect.right=1135;var outside=eval(expression);
+          return JSON.stringify([partial,obstructed,outside]);
+        }''')
+        result=subprocess.run(['osascript','-l','JavaScript',str(script)],capture_output=True,text=True,timeout=15)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout),[{'x':987.5,'y':45},None,None])
 
     def test_rotation_repeats_and_retry_does_not_advance(self):
         results=[music.reserve_music(self.base,'akun1',cid,TRACKS)['title'] for cid in [1,2,1,3,4]]
@@ -115,6 +156,23 @@ class MusicFavoritesTests(unittest.TestCase):
         sim=MusicSimulator();sim.saved=['Unknown']
         with self.assertRaises(music.MusicError):self.apply(sim)
         self.assertNotIn('save',sim.events)
+
+    def test_tours_during_music_steps_close_before_controls_are_read(self):
+        sim=MusicSimulator(tour_after=['open','favorites','add','save','cancel'])
+        self.apply(sim)
+        self.assertEqual(sim.saved,['A'])
+        self.assertFalse(sim.tour)
+        self.assertFalse(sim.editor)
+        self.assertEqual(len([e for e in sim.events if isinstance(e,dict)]),1)
+        self.assertEqual(sim.events.count('save'),1)
+        self.assertEqual(sim.events.count('tour'),6)
+        self.assertEqual(music.reserve_music(self.base,'akun1',2,TRACKS)['title'],'B')
+
+    def test_stuck_music_tour_stops_before_assignment_or_save(self):
+        sim=MusicSimulator(tour_after=['open'],tour_stuck=True)
+        with self.assertRaisesRegex(RuntimeError,'Tour onboarding'):self.apply(sim)
+        self.assertNotIn('save',sim.events)
+        self.assertFalse((self.base/'db/music_rotation.db').exists())
 
 
 if __name__=='__main__':unittest.main()

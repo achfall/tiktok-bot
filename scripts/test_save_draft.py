@@ -86,6 +86,7 @@ def pick_test_item(account_slug):
 
 
 def main():
+    raise SystemExit('Script upload lama dinonaktifkan; gunakan panel atau daily_orchestrator.py --publish --retest-content ID --test-draft.')
     account_slug = sys.argv[1]
     item = pick_test_item(account_slug)
     print(f"Produk test : {item['folder_name']} (ID: {item['tiktok_product_id']})")
@@ -190,8 +191,4 @@ def main():
 
 
 if __name__ == "__main__":
-    with sqlite3.connect(Path(DB_PATH).as_uri() + "?mode=ro", uri=True) as check:
-        columns = {row[1] for row in check.execute("PRAGMA table_info(accounts)")}
-        if "content_group_id" in columns and check.execute("SELECT 1 FROM accounts WHERE content_group_id IS NOT NULL").fetchone():
-            raise SystemExit("Script lama tidak mendukung antrean konsep; gunakan daily_orchestrator.py.")
     main()

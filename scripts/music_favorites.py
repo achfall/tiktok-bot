@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import sqlite3
 import time
+from upload_overlays import dismiss_known_tours
 
 
 class MusicError(RuntimeError):
@@ -60,8 +61,14 @@ def button_js(label, scope='document'):
     return f'''(() => {{{VISIBLE_JS}const root={scope};if(!root)return null;
     const buttons=Array.from(root.querySelectorAll('button')).filter(e=>(e.innerText||'').trim()==={json.dumps(label)}&&visible(e));
     if(buttons.length!==1||buttons[0].disabled||buttons[0].getAttribute('data-disabled')==='true')return null;
-    buttons[0].scrollIntoView({{block:'center'}});const r=buttons[0].getBoundingClientRect();
-    return {{x:r.x+r.width/2,y:r.y+r.height/2}};}})()'''
+    buttons[0].scrollIntoView({{block:'center',behavior:'instant'}});const r=buttons[0].getBoundingClientRect();
+    // Klik pusat bagian yang benar-benar berada di viewport. Header editor
+    // dapat lebih lebar dari jendela sehingga pusat Save berada di luar layar.
+    const left=Math.max(0,r.left),right=Math.min(window.innerWidth,r.right);
+    const top=Math.max(0,r.top),bottom=Math.min(window.innerHeight,r.bottom);
+    if(right<=left||bottom<=top)return null;
+    const x=(left+right)/2,y=(top+bottom)/2;
+    return buttons[0].contains(document.elementFromPoint(x,y))?{{x,y}}:null;}})()'''
 
 
 SOUNDS_JS = button_js('Sounds')
@@ -105,9 +112,11 @@ def add_music_js(choice):
  const panel=root.querySelector('[role="tabpanel"][data-state="active"]');if(!panel)return null;
  const rows=Array.from(panel.querySelectorAll('.MusicPanelMusicItem__wrap')).filter(e=>(e.querySelector('.MusicPanelMusicItem__infoBasicTitle')?.innerText||'').trim()==={json.dumps(choice['title'])}&&(e.querySelector('.MusicPanelMusicItem__infoBasicDesc')?.innerText||'').trim()==={json.dumps(choice['detail'])});
  if(rows.length!==1)return null;const icon=rows[0].querySelector('svg[data-icon="plus-bold"]');
- if(!icon)return null;icon.scrollIntoView({{block:'center'}});if(!visible(icon))return null;
+ if(!icon)return null;icon.scrollIntoView({{block:'center',behavior:'instant'}});if(!visible(icon))return null;
  const disabled=icon.closest('[disabled],[aria-disabled="true"],[data-disabled="true"]');if(disabled)return null;
- const r=icon.getBoundingClientRect();return {{x:r.x+r.width/2,y:r.y+r.height/2}};}})()'''
+ const r=icon.getBoundingClientRect(),x=r.x+r.width/2,y=r.y+r.height/2;
+ const hit=document.elementFromPoint(x,y),operation=icon.closest('.MusicPanelMusicItem__operation');
+ return hit&&(icon.contains(hit)||(operation&&operation.contains(hit)))?{{x,y}}:null;}})()'''
 
 
 class MusicUI:
@@ -115,6 +124,9 @@ class MusicUI:
         self.ws, self.mid, self.evaluate_fn, self.click_fn = ws, mid, evaluate, click
 
     def read(self, expression):
+        # Termasuk polling, scroll Favorites, serta verifikasi Save. Target
+        # kontrol baru dicari sesudah tour ditutup agar koordinat tidak usang.
+        self.mid = dismiss_known_tours(self.ws, self.mid, self.evaluate_fn, self.click_fn, time.sleep, allow_backdrop=False)
         value = self.evaluate_fn(self.ws, expression, self.mid)
         self.mid += 1
         return value

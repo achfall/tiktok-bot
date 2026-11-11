@@ -9,6 +9,7 @@ import websocket
 from daily_orchestrator import DB_PATH, OVERRIDE_TEXT, CAPTION_READ_JS, eval_js, click, wait_for_submission
 from archive_used import archive_after_success
 from content_queue import claim_video, begin_submission, finish_success, finish_failure
+from bot_settings import effective_settings
 
 
 def main():
@@ -50,7 +51,7 @@ def main():
             claim=claim_video(conn,aid,pid,cid)
             if claim is None:raise SystemExit('Video sudah diklaim akun lain; tidak diklik.')
             try:
-                begin_submission(conn,claim,caption)
+                begin_submission(conn,claim,caption,daily_limit=effective_settings(DB_PATH.parent.parent,args.account)['max_per_day'])
                 mid=click(ws,button['x'],button['y'],2)
                 success,url,_=wait_for_submission(ws,mode,mid)
             except BaseException as error:

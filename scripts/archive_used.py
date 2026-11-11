@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arsipkan video used yang punya hasil success/draft; tidak hapus otomatis."""
+"""Arsipkan video used yang punya hasil success/draft/scheduled; tidak hapus otomatis."""
 import argparse
 import os
 from pathlib import Path
@@ -30,7 +30,7 @@ def archive_content(conn, content_id):
         ).fetchone()
         if not row or row[2] != 'used':
             raise ValueError('Hanya video used yang boleh diarsipkan')
-        if not conn.execute("SELECT 1 FROM posts_log WHERE content_id=? AND status IN ('success','draft')", (content_id,)).fetchone():
+        if not conn.execute("SELECT 1 FROM posts_log WHERE content_id=? AND status IN ('success','draft','scheduled')", (content_id,)).fetchone():
             raise ValueError('Hasil publish/draft terverifikasi belum tercatat')
         source = Path(row[0])
         product = Path(row[1])
@@ -39,7 +39,7 @@ def archive_content(conn, content_id):
         flat = flat and conn.execute('SELECT 1 FROM account_sources WHERE folder_path=?',(str(product),)).fetchone()
         if row[3] and not flat:
             owner = conn.execute(
-                "SELECT a.chrome_profile_path FROM accounts a WHERE a.id=COALESCE(?,(SELECT account_id FROM posts_log WHERE content_id=? AND status IN ('success','draft') ORDER BY id DESC LIMIT 1))",
+                "SELECT a.chrome_profile_path FROM accounts a WHERE a.id=COALESCE(?,(SELECT account_id FROM posts_log WHERE content_id=? AND status IN ('success','draft','scheduled') ORDER BY id DESC LIMIT 1))",
                 (row[4], content_id),
             ).fetchone()
             if not owner:
@@ -106,7 +106,7 @@ def main():
         rows = conn.execute(
             "SELECT c.id FROM contents c JOIN products p ON p.id=c.product_id "
             "JOIN accounts a ON a.id=COALESCE(c.used_by,p.account_id) WHERE a.slug=? AND c.status='used' "
-            "AND EXISTS (SELECT 1 FROM posts_log l WHERE l.content_id=c.id AND l.status IN ('success','draft'))",
+            "AND EXISTS (SELECT 1 FROM posts_log l WHERE l.content_id=c.id AND l.status IN ('success','draft','scheduled'))",
             (args.account,),
         ).fetchall()
         failures = sum(not archive_after_success(conn, row[0]) for row in rows)

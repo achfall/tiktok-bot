@@ -77,6 +77,18 @@ class ControlService:
     def state(self):
         with closing(self.connection()) as conn:
             accounts=[dict(r) for r in conn.execute('SELECT a.*,g.name concept,g.folder_path concept_path FROM accounts a LEFT JOIN content_groups g ON g.id=a.content_group_id ORDER BY a.id')]
+            post_counts={r['account_id']:dict(r) for r in conn.execute('''
+                SELECT account_id,
+                    SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) published,
+                    SUM(CASE WHEN status='scheduled' THEN 1 ELSE 0 END) scheduled,
+                    SUM(CASE WHEN status='draft' THEN 1 ELSE 0 END) drafts
+                FROM posts_log GROUP BY account_id''')}
+            post_totals={'published':0,'scheduled':0,'drafts':0}
+            for account in accounts:
+                counts=post_counts.get(account['id'],{})
+                account['post_counts']={key:counts.get(key,0) for key in post_totals}
+                for key in post_totals:
+                    post_totals[key]+=account['post_counts'][key]
             concepts=[dict(r) for r in conn.execute('SELECT * FROM content_groups ORDER BY name')]
             products=[dict(r) for r in conn.execute('SELECT p.*,a.slug account,g.name concept FROM products p JOIN accounts a ON a.id=p.account_id LEFT JOIN content_groups g ON g.id=a.content_group_id ORDER BY a.id,p.sort_order')]
             queue=[dict(r) for r in conn.execute('''SELECT c.*,p.folder_name product,a.slug claimed_account,
@@ -122,7 +134,7 @@ class ControlService:
         env=dotenv_values(self.base/'.env')
         for row in history:
             if row['error_message']:row['error_message']=self.redact(row['error_message'])
-        return {'diagnostics':{'schedule_min_lead_minutes':MIN_LEAD_MINUTES,'schedule_max_days':MAX_SCHEDULE_DAYS,'schedule_step_minutes':SCHEDULE_STEP_MINUTES},'api_version':API_VERSION,'schema':FIELDS,'accounts':accounts,'concepts':concepts,'products':products,'queue':queue,'history':history,'stats':stats,'runs':runs,'config':config,'effective':effective_settings(self.base),'keys':{k:bool(env.get(k)) for k in KEYS},'local_time':datetime.now().isoformat(timespec='seconds'),'root':str(self.base),'scheduler_note':'Jadwal berjalan saat panel lokal aktif. Saat Mac sleep, proses aktif tertunda dan lanjut otomatis setelah bangun. Internet harus tersedia. Jadwal mulai yang terlewat tidak dijalankan otomatis.'}
+        return {'post_totals':post_totals,'diagnostics':{'schedule_min_lead_minutes':MIN_LEAD_MINUTES,'schedule_max_days':MAX_SCHEDULE_DAYS,'schedule_step_minutes':SCHEDULE_STEP_MINUTES},'api_version':API_VERSION,'schema':FIELDS,'accounts':accounts,'concepts':concepts,'products':products,'queue':queue,'history':history,'stats':stats,'runs':runs,'config':config,'effective':effective_settings(self.base),'keys':{k:bool(env.get(k)) for k in KEYS},'local_time':datetime.now().isoformat(timespec='seconds'),'root':str(self.base),'scheduler_note':'Jadwal berjalan saat panel lokal aktif. Saat Mac sleep, proses aktif tertunda dan lanjut otomatis setelah bangun. Internet harus tersedia. Jadwal mulai yang terlewat tidak dijalankan otomatis.'}
 
     def create_account(self,data):
         name=str(data.get('name','')).strip();concept=str(data.get('concept','')).strip()

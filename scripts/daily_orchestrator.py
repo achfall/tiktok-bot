@@ -113,6 +113,9 @@ def click(ws, x, y, mid):
               {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}, msg_id=mid)
     send_cdp(ws, "Input.dispatchMouseEvent",
               {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}, msg_id=mid + 1)
+    # Beri halaman waktu bereaksi sebelum membaca atau memilih kontrol berikutnya.
+    # Tunggu sesudah klik agar koordinat hasil pemetaan tidak menjadi kedaluwarsa.
+    time.sleep(STEP_DELAY)
     return mid + 2
 
 

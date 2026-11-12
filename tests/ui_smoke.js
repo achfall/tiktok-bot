@@ -5,7 +5,7 @@ function run(argv) {
   var root=argv[0], state=JSON.parse(read(argv[1])), source=read(root+'/web/app.js');
   var nodes={},listeners={};
   function node(selector) {
-    if(!nodes[selector])nodes[selector]={innerHTML:'',textContent:'',open:false,disabled:false,className:'',classList:{add:function(){},remove:function(){}},close:function(){this.open=false;},showModal:function(){this.open=true;}};
+    if(!nodes[selector])nodes[selector]={innerHTML:'',textContent:'',open:false,disabled:false,className:'',addEventListener:function(){},classList:{add:function(){},remove:function(){}},close:function(){this.open=false;},showModal:function(){this.open=true;}};
     return nodes[selector];
   }
   var document={hidden:false,querySelector:function(selector){

@@ -16,11 +16,27 @@ Lalu buka **http://127.0.0.1:8765**. Alternatif: double-click `Buka Panel.comman
 di folder proyek. Terminal server perlu tetap terbuka; Ctrl+C menutup panel.
 Port bisa diganti dengan `--port 8766`. Aplikasi hanya menerima koneksi lokal.
 
+Pada Mac ini, panel sudah diatur otomatis lewat LaunchAgent
+`~/Library/LaunchAgents/local.ruangkonten.panel.plist`. Setelah restart dan login,
+cukup buka **http://127.0.0.1:8765**, tanpa Terminal. launchd menyalakan kembali
+panel jika prosesnya berhenti. Bot tetap dijalankan dari kartu akun atau jadwal
+panel yang sudah diaktifkan. Jangan jalankan server panel manual kedua pada port
+yang sama. Log layanan: `logs/panel-service.log`.
+
+Untuk menyiapkan ulang file layanan setelah pindah lokasi proyek, gunakan
+`venv/bin/python scripts/prepare_panel_launchd.py`; perintah ini hanya menghasilkan
+plist di `config/launchd/`, tidak memasang atau mengaktifkannya. LaunchAgent panel
+terpisah dari layanan automasi akun `local.tiktokbot.*`.
+
 Urutan menu: **Ringkasan → Akun TikTok → Riwayat & proses → Konten & jadwal**,
-diikuti Diagnostik dan Pengaturan. **Konten & jadwal** berisi tiga tab:
+diikuti Diagnostik dan Pengaturan. Ringkasan menampilkan total publish, Schedule,
+dan draft sepanjang riwayat bot; kartu akun menampilkan hitungan masing-masing.
+Publish & Schedule tidak mencakup draft, kegagalan, atau hasil belum pasti.
+Schedule berarti berhasil dijadwalkan, belum diverifikasi sudah tayang. **Konten & jadwal** berisi tiga tab:
 **Produk & video** untuk stok, **Antrean video** untuk status dan hasil tertahan,
 serta **Jadwal mulai bot** untuk waktu mulai automasi. Jam tayang Schedule post
-tetap di pengaturan akun. Tautan halaman lama tetap dapat dibuka.
+tetap di pengaturan akun. Jarak minimum dari mulai posting adalah 35 menit,
+dibulatkan ke atas per 5 menit: mulai 09:03 → paling awal 09:40 WIB. Tautan halaman lama tetap dapat dibuka.
 
 Panel menyediakan akun/profil Chrome, konsep/anggota, produk/ID TikTok Shop,
 unggah MP4/MOV ke folder lokal, scan antrean, tes E2E, mulai/hentikan proses,
@@ -46,7 +62,9 @@ caption, atau folder konten. Tombol Simpan/Batal tetap terlihat
 saat form digulir. Jam mulai ditulis dalam
 format 24 jam `HH:MM`, misalnya `10:00`, `21:00`, atau `10:30`. Jeda minimum dan
 maksimum ditampilkan berdampingan. Jeda paling singkat 60 menit
-(1 jam); default jeda acak 60–90 menit. Pengaturan khusus akun berlaku pada proses
+(1 jam); default jeda acak 60–90 menit. Setiap klik browser diberi jeda sesuai **Jeda langkah browser**, default 1 detik,
+selain penantian kesiapan kontrol/animasi. Jeda ini untuk kestabilan interaksi,
+bukan jaminan menghindari deteksi automasi. Pengaturan khusus akun berlaku pada proses
 berikutnya tanpa menjalankan posting atau mengaktifkan jadwal. Mode **Simpan
 draft** / **Publish langsung** / **Schedule post** dipilih dengan tiga pilihan berdampingan di dialog
 yang sama, tanpa checkbox konfirmasi saat menyimpan mode. Kolom **Nama link
@@ -178,6 +196,11 @@ Referensi batas video belanja: [TikTok Shop](https://seller-us.tiktok.com/univer
 Kalender TikTok menjadi pemeriksaan akhir batas tanggal; tanggal nonaktif,
 zona waktu selain GMT+7, atau kontrol yang berubah menghentikan proses sebelum
 submit. Batas akun/region dapat berbeda; bot tidak melewati validasi TikTok.
+
+Pemilih Schedule mendukung dua tampilan Studio: combobox dan kolom tanggal/jam
+readonly. Pada tampilan lama bot memilih tanggal kalender serta jam/menit melalui
+kontrolnya, menunggu animasi selesai, lalu memverifikasi ulang tanggal, jam, WIB,
+dan tombol Schedule. Kontrol ambigu atau nilai yang tidak cocok membatalkan submit.
 
 Batas harian dipakai bersama oleh publish, draft, Schedule, dan submit yang belum
 pasti. Batas 12 dengan 2 publish dan 1 draft menyisakan 9 Schedule. Tanggal tayang

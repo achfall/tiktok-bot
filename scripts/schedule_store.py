@@ -4,11 +4,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from contextlib import closing
 import sqlite3
+from bot_settings import SCHEDULE_MIN_LEAD_MINUTES, first_schedule_minutes
 
 WIB = ZoneInfo('Asia/Jakarta')
-# Shoppable videos dapat mensyaratkan 30 menit; sisakan 5 menit untuk submit.
+# Batas platform tetap terpisah dari minimum operasional 35 menit.
 PLATFORM_MIN_LEAD_MINUTES = 30
-MIN_LEAD_MINUTES = PLATFORM_MIN_LEAD_MINUTES + 5
+MIN_LEAD_MINUTES = SCHEDULE_MIN_LEAD_MINUTES
 
 
 def now_wib():
@@ -89,7 +90,7 @@ def batch_for(conn, account_id, settings, now=None):
                            'WHERE account_id=? AND complete=0 ORDER BY id DESC LIMIT 1', (account_id,)).fetchone()
         if row:
             return dict(zip(('id', 'quota_day', 'first_at', 'interval_minutes'), row))
-        first = now.replace(hour=settings['schedule_start_hour'], minute=settings['schedule_start_minute'], second=0, microsecond=0)
+        first = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(minutes=first_schedule_minutes(settings))
         conn.execute('INSERT INTO schedule_meta.batches '
                      '(account_id,quota_day,first_at,interval_minutes) VALUES (?,?,?,?) '
                      'ON CONFLICT(account_id,quota_day) DO UPDATE SET first_at=excluded.first_at,'

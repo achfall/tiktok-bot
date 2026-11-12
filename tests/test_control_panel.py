@@ -65,6 +65,18 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(status,200);self.assertIn(b'Content-Security-Policy:',headers);self.assertIn(b'Ruang Konten',body)
         self.assertEqual(self.request('/.env')[0],404)
 
+    def test_lifetime_post_counts_include_old_history_and_exclude_incomplete_results(self):
+        self.service.create_account({'name':'empty.fixture'})
+        with closing(sqlite3.connect(self.db)) as conn,conn:
+            conn.executemany("INSERT INTO posts_log(account_id,status,published_at) VALUES (1,?,datetime('now','-30 days'))",[('success',)]*155+[('scheduled',)]*7+[('draft',)]*4+[('failed',),('uncertain',),('submitting',)])
+        status,_,body=self.request('/api/v1/state')
+        self.assertEqual(status,200)
+        state=json.loads(body)
+        self.assertEqual(state['post_totals'],{'published':155,'scheduled':7,'drafts':4})
+        self.assertEqual(state['accounts'][0]['post_counts'],state['post_totals'])
+        self.assertEqual(state['accounts'][1]['post_counts'],{'published':0,'scheduled':0,'drafts':0})
+        self.assertEqual(len(state['history']),150)
+
     def test_cross_origin_and_missing_token_cannot_mutate(self):
         self.assertEqual(self.request('/api/v1/concepts/create','POST',{'name':'evil'},headers={'Origin':'http://evil.example'})[0],403)
         self.assertEqual(self.request('/api/v1/concepts/create','POST',{'name':'evil'},headers={'X-Panel-Token':''})[0],403)

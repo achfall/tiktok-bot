@@ -60,6 +60,26 @@ class ScheduleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.next_slot(first, 7, first)
 
+    def test_first_show_is_at_least_35_minutes_rounded_up(self):
+        for hour,minute,expected in [(9,3,(9,40)),(9,0,(9,35)),(9,1,(9,40)),(23,30,(0,5)),(23,58,(0,35))]:
+            values={**self.runtime,'window_start_hour':hour,'window_start_minute':minute,
+                    'schedule_start_hour':0 if hour==23 else hour,'schedule_start_minute':0}
+            normalized=validate_values(values)
+            self.assertEqual((normalized['schedule_start_hour'],normalized['schedule_start_minute']),expected)
+            self.assertEqual(validate_values(normalized),normalized)
+        values={**self.runtime,'window_start_hour':9,'window_start_minute':3,
+                'schedule_start_hour':9,'schedule_start_minute':35}
+        batch=store.batch_for(self.conn,1,values,self.now.replace(hour=9,minute=3))
+        self.assertEqual(datetime.fromisoformat(batch['first_at']).strftime('%H:%M'),'09:40')
+
+    def test_first_show_crosses_midnight_without_changing_quota_day(self):
+        settings={**self.runtime,'window_start_hour':23,'window_start_minute':30,
+                  'schedule_start_hour':0,'schedule_start_minute':0}
+        batch=store.batch_for(self.conn,1,settings,self.now.replace(hour=23,minute=30))
+        target=datetime.fromisoformat(batch['first_at'])
+        self.assertEqual(target,self.now.replace(day=12,hour=0,minute=5))
+        self.assertEqual(batch['quota_day'],'2026-11-11')
+
     def test_config_three_modes_roundtrip_and_invalid_steps_do_not_write(self):
         for mode in ('auto', 'manual_review', 'schedule'):
             self.service.update_account({'account':'akun1','mode':mode,'values':{'schedule_start_hour':17,'schedule_start_minute':30,'schedule_interval_minutes':30}})
